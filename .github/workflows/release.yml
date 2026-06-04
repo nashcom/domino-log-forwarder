@@ -2,7 +2,9 @@ name: Release
 
 on:
   release:
-    types: [published, edited] 
+    types: [published, edited]
+
+  workflow_dispatch:
 
 jobs:
   release:
@@ -10,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
 
     permissions:
-      contents: write  # Required to create releases
+      contents: write
 
     steps:
       - name: Checkout code
@@ -22,11 +24,20 @@ jobs:
             -v "$PWD":/src \
             -w /src \
             alpine:latest \
-            sh -c "apk add --no-cache g++ make musl-dev curl-dev curl-static rapidjson-dev openssl-libs-static zlib-static brotli-static zstd-static libpsl-static libunistring-static libidn2-static nghttp2-static nghttp3-static c-ares && SPECIAL_LINK_OPTIONS=-static make"
-            VERSION=$(cat version.txt)
-            DOMFWD_BIN="domfwd-$VERSION"
-            cp domfwd "$DOMFWD_BIN"
-            sha256sum "$DOMFWD_BIN" | cut -f1 -d" " > checksum.txt
+            sh -c "apk add --no-cache \
+              g++ make musl-dev curl-dev curl-static \
+              rapidjson-dev openssl-libs-static zlib-static \
+              brotli-static zstd-static libpsl-static \
+              libunistring-static libidn2-static \
+              nghttp2-static nghttp3-static c-ares && \
+              SPECIAL_LINK_OPTIONS=-static make"
+
+          VERSION=$(cat version.txt)
+          DOMFWD_BIN="domfwd-$VERSION"
+
+          cp domfwd "$DOMFWD_BIN"
+
+          sha256sum "$DOMFWD_BIN" | cut -f1 -d" " > checksum.txt
 
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
@@ -36,4 +47,3 @@ jobs:
             checksum.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
