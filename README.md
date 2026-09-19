@@ -37,6 +37,7 @@ NGINX (syslog) ──────────── UNIX datagram ───┤
                                                      │
                                                      ▼
                                            any OTLP receiver
+                                        (tested with Grafana Loki)
 ```
 
 Inputs:
@@ -360,7 +361,7 @@ The folder `examples` contains sample data and two scripts which push it with `o
 By default they push to the [test container](#testing) at `http://127.0.0.1:4318/v1/logs`.
 
 ```bash
-bash examples/push-stdin.sh
+./examples/push-stdin.sh
 ```
 
 Pipe mode: pushes `examples/sample-console.log` (Domino console lines) from STDIN. The same without the script:
@@ -376,10 +377,10 @@ OTLP_PUSH_API_URL=http://127.0.0.1:4318/v1/logs ./otelfwd -cfg
 ```
 
 ```bash
-bash examples/push-socket.sh
+./examples/push-socket.sh
 ```
 
-Standalone mode: starts `otelfwd -nostdin` with a TCP input on `127.0.0.1:4390`, sends `examples/sample-records.jsonl` (the Domino event, an NGINX style record and two plain records) and stops it. `bash examples/push-socket.sh unix` uses a Unix socket (needs `socat` or `nc`).
+Standalone mode: starts `otelfwd -nostdin` with a TCP input on `127.0.0.1:4390`, sends `examples/sample-records.jsonl` (the Domino event, an NGINX style record and two plain records) and stops it. `./examples/push-socket.sh unix` uses a Unix socket (needs `socat` or `nc`).
 The same by hand, in two terminals:
 
 ```bash
@@ -406,13 +407,13 @@ Both scripts print how many lines were pushed and return an error if the push fa
 It is built from Alpine with Docker Compose. See [tools/otel-sink/README.md](tools/otel-sink/README.md).
 
 ```bash
-cd tools/otel-sink && BUILDKIT_PROGRESS=plain OTEL_SINK_UID=$(id -u) OTEL_SINK_GID=$(id -g) docker compose up
+./tools/otel-sink/run.sh
 ```
 
 The whole path can be load tested: `nginx/run_loadtest.sh` starts the sink, `otelfwd` and a test NGINX, sends a large number of requests and checks that every event arrives, how fast, and where events are lost if not. See [nginx/README.md](nginx/README.md#load-test).
 
 ```bash
-bash nginx/run_loadtest.sh
+./nginx/run_loadtest.sh
 ```
 
 ## Metrics

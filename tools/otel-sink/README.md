@@ -14,63 +14,62 @@ It forwards every accepted request over a UNIX socket to `otel-sink`, which writ
 
 The image is built from Alpine. NGINX is installed from the Alpine repository, `otel-sink` is compiled in the build. Everything runs as a non-root user.
 
-## Build and run
+## Quick start
 
-With Docker Compose. The image is built from the Dockerfile when it does not exist yet:
-
-```bash
-cd tools/otel-sink
-
-BUILDKIT_PROGRESS=plain OTEL_SINK_UID=$(id -u) OTEL_SINK_GID=$(id -g) docker compose up
-```
-
-`BUILDKIT_PROGRESS=plain` prints the build log as plain text instead of the animated view. It is optional.
-Add `--build` to build the image again after changing the sources. The files are written to `tools/otel-sink/otel-data`.
-`OTEL_SINK_UID` and `OTEL_SINK_GID` make them belong to you. Without them the container runs with uid and gid 1000.
-The settings below can be passed the same way, or written into a file named `.env` next to `docker-compose.yml`:
+You need Docker. From the repository root:
 
 ```bash
-OTEL_SINK_TOKEN=secret OTEL_SINK_UID=$(id -u) OTEL_SINK_GID=$(id -g) docker compose up
+./tools/otel-sink/run.sh --detach
 ```
 
-Without Compose:
+The first start builds the image. The script returns when the receiver answers on port 4318. Point `otelfwd` at it:
 
 ```bash
-BUILDKIT_PROGRESS=plain docker build -t otel-test-sink tools/otel-sink
-
-mkdir -p otel-data
-
-docker run --rm --name otel-test-sink --hostname otel-test-sink --user "$(id -u):$(id -g)" \
-  -p 127.0.0.1:4318:4318 -p 127.0.0.1:4319:4319 -p 127.0.0.1:4320:4320 \
-  -v "$PWD/otel-data:/data" otel-test-sink
+OTLP_PUSH_API_URL=http://127.0.0.1:4318/v1/logs otelfwd ...
 ```
 
-Without `--user` the container runs as user `otel` (uid 1000), which needs a volume it can write to.
-
-The container is named `otel-test-sink` and its host name is `otel-test-sink` as well (Docker would otherwise use the random container id). Other containers on the same Docker network reach it under that name, for example `https://otel-test-sink:4319/v1/logs`.
-
-## Start with run.sh
-
-`run.sh` does the steps above for you: it sets the user of the container, creates `otel-data`, builds the image if needed and starts the container.
+Every request `otelfwd` sends is now a JSON file in `tools/otel-sink/otel-data/received`. Stop the receiver with:
 
 ```bash
-bash run.sh              # foreground. Ctrl-C stops the container and removes it (docker compose down)
-bash run.sh --detach     # in the background, returns when port 4318 answers
-bash run.sh --stop       # docker compose down
-bash run.sh --rebuild    # first remove the image (docker compose down --rmi local) and build it again without the build cache
+./tools/otel-sink/run.sh --stop
 ```
 
-`--detach` and `--rebuild` can be combined. The received files stay in `otel-data/received` after `down`. As root, the container runs as the owner of the directory, so the files do not belong to root. The settings below are passed on to `docker-compose.yml` as environment variables.
+### Options of run.sh
 
-## Shell in the container
+`run.sh` sets the user of the container, creates `otel-data`, builds the image if it does not exist yet and starts the container. It can be started from any directory.
 
-The image contains `bash`:
+| Command              | What it does                                                                                            |
+| :------------------- | :------------------------------------------------------------------------------------------------------ |
+| `./run.sh`           | Foreground. Ctrl-C stops the container and removes it (`docker compose down`)                           |
+| `./run.sh --detach`  | In the background. Returns when port 4318 answers                                                       |
+| `./run.sh --stop`    | `docker compose down`                                                                                   |
+| `./run.sh --rebuild` | First removes the image (`docker compose down --rmi local`) and builds it again without the build cache |
+
+`--detach` and `--rebuild` can be combined. `--stop` stands alone.
+The files stay in `otel-data/received` after `down`. The container runs as your user, so the files belong to you. As root, it runs as the owner of the directory instead of root.
+The [settings](#settings) are passed on to `docker-compose.yml` as environment variables:
 
 ```bash
-docker exec -it otel-test-sink bash
+OTEL_SINK_TOKEN=secret ./run.sh --detach
 ```
 
-Useful places inside the container: `/data/received` (the files), `/data/nginx-access.log`, `/tmp/otel-sink/nginx.conf` (the NGINX configuration which is generated at start) and `/tmp/otel-sink/locations.conf`.
+## Use with otelfwd
+
+The variants for the other ports:
+
+```bash
+# HTTP
+OTLP_PUSH_API_URL=http://127.0.0.1:4318/v1/logs otelfwd ...
+
+# HTTP with a token (container started with -e OTEL_SINK_TOKEN=secret)
+OTLP_PUSH_API_URL=http://127.0.0.1:4318/v1/logs OTLP_PUSH_TOKEN=secret otelfwd ...
+
+# HTTPS: trust the generated certificate
+OTLP_PUSH_API_URL=https://127.0.0.1:4319/v1/logs OTLP_CA_FILE=otel-data/certs/cert.pem otelfwd ...
+
+# Retry and WAL: this port always fails, the lines stay in the WAL until the endpoint is changed
+OTLP_PUSH_API_URL=http://127.0.0.1:4320/v1/logs otelfwd ...
+```
 
 ## Ports
 
@@ -94,27 +93,6 @@ Environment variables of the container (`docker run -e NAME=value`, or the same 
 | `OTEL_SINK_RAW`         | `1`: write the bodies as received, do not pretty print JSON                         | pretty print                                                                         |
 
 The token may contain letters, digits and `. _ ~ + / = -`. Invalid values stop the container with a message.
-
-## Files
-
-The volume `/data` contains:
-
-| Path               | Content                                                                |
-| :----------------- | :--------------------------------------------------------------------- |
-| `received/`        | One file per POST                                                      |
-| `certs/cert.pem`   | The generated certificate. Use it as `OTLP_CA_FILE` for the HTTPS port |
-| `certs/key.pem`    | Its private key                                                        |
-| `nginx-access.log` | NGINX access log, including refused and failing requests               |
-
-File names look like `000001_20260918T201530.123Z_v1-logs.json`: a sequence number, the UTC time, and the request path.
-The numbering continues after a restart.
-
-* A JSON body is pretty printed (`OTEL_SINK_RAW=1` keeps it as received).
-* A body which is not JSON, for example protobuf, is written as `.bin`.
-* A gzip compressed body is decompressed first. Other encodings are stored as `.bin`.
-* Each request is also logged by the container: sequence number, path, number of log records, size and file name. Requests with load test events are neither stored nor logged one by one, see [Load test ledger](#load-test-ledger).
-
-The certificate is kept in the volume. It is generated again when `OTEL_SINK_SAN` changes or when the files are deleted.
 
 ## Quick test with curl
 
@@ -159,6 +137,78 @@ curl -s -w '\nHTTP %{http_code}\n' -X POST http://127.0.0.1:4320/v1/logs -H 'Con
 Use `localhost` (not `127.0.0.1`) for HTTPS: the certificate contains the names `localhost` and `otel-test-sink`.
 Without `--cacert`, curl refuses the self-signed certificate with exit code 60.
 
+## Files
+
+The volume `/data` contains:
+
+| Path               | Content                                                                |
+| :----------------- | :--------------------------------------------------------------------- |
+| `received/`        | One file per POST                                                      |
+| `certs/cert.pem`   | The generated certificate. Use it as `OTLP_CA_FILE` for the HTTPS port |
+| `certs/key.pem`    | Its private key                                                        |
+| `nginx-access.log` | NGINX access log, including refused and failing requests               |
+
+File names look like `000001_20260918T201530.123Z_v1-logs.json`: a sequence number, the UTC time, and the request path.
+The numbering continues after a restart.
+
+* A JSON body is pretty printed (`OTEL_SINK_RAW=1` keeps it as received).
+* A body which is not JSON, for example protobuf, is written as `.bin`.
+* A gzip compressed body is decompressed first. Other encodings are stored as `.bin`.
+* Each request is also logged by the container: sequence number, path, number of log records, size and file name. Requests with load test events are neither stored nor logged one by one, see [Load test ledger](#load-test-ledger).
+
+The certificate is kept in the volume. It is generated again when `OTEL_SINK_SAN` changes or when the files are deleted.
+
+## Example scripts
+
+The folder `examples` contains test scripts which use curl (and only standard tools, no `jq`). They need bash, so on Windows run them in WSL or Git Bash.
+
+```bash
+cd tools/otel-sink
+
+./examples/run-all.sh
+```
+
+| Script              | What it does                                                                                        |
+| :------------------ | :-------------------------------------------------------------------------------------------------- |
+| `send-log.sh`       | Sends one log record. The smallest example: `./examples/send-log.sh "message" 17`                   |
+| `test-basic.sh`     | Health check, one POST, the file name, pretty printed JSON, another path                            |
+| `test-https.sh`     | HTTPS with the generated certificate, and the refusal without `--cacert` (curl exit code 60)        |
+| `test-token.sh`     | Bearer token: 401 without, with a wrong token, and 200 with the right one. Skipped without a token  |
+| `test-fail-port.sh` | The port which always fails: status code, nothing stored                                            |
+| `test-gzip.sh`      | Compressed request body is stored decompressed. A body which is not gzip gets 400                   |
+| `test-errors.sh`    | Binary body and broken JSON (stored as `.bin`), a PUT (405), a path with `..`                       |
+| `test-parallel.sh`  | 20 clients at the same time (`PARALLEL=50` for more): every request in its own file, numbers unique |
+| `test-large.sh`     | 3000 log records in one POST (`LARGE_RECORDS=10000`), and a 33 MB request which is refused with 413 |
+| `run-all.sh`        | Runs all tests and prints a summary                                                                 |
+
+Each script prints `PASS`, `FAIL` or `SKIP` per check and returns 0 when nothing failed. `run-all.sh` returns 2 when the sink is not reachable.
+
+The scripts are configured with environment variables. The defaults match the container as started by `docker compose up`:
+
+| Variable           | Description                                                                 | Default                     |
+| :----------------- | :-------------------------------------------------------------------------- | :-------------------------- |
+| `SINK_HOST`        | Address of the container                                                    | `127.0.0.1`                 |
+| `SINK_HTTP_PORT`   | OTLP/HTTP port                                                              | `4318`                      |
+| `SINK_HTTPS_PORT`  | OTLP/HTTPS port                                                             | `4319`                      |
+| `SINK_FAIL_PORT`   | The port which always fails                                                 | `4320`                      |
+| `SINK_TOKEN`       | Bearer token, when the container was started with `OTEL_SINK_TOKEN`         | none                        |
+| `SINK_FAIL_STATUS` | Status code of the failing port                                             | `503`                       |
+| `SINK_DATA_DIR`    | The `/data` volume on the host                                              | `tools/otel-sink/otel-data` |
+| `SINK_CONTAINER`   | Container name, used with `docker exec` when `SINK_DATA_DIR` does not exist | `otel-test-sink`            |
+
+The scripts check the received files in `SINK_DATA_DIR`, or with `docker exec` if that directory does not exist. Without access to the files, the checks on the files are skipped.
+Every run marks its records with its own id, so old files do not disturb a run.
+
+```bash
+# the container was started with OTEL_SINK_TOKEN=secret
+SINK_TOKEN=secret ./examples/run-all.sh
+
+# a container on another host
+SINK_HOST=192.168.1.20 SINK_DATA_DIR=/nonexistent ./examples/run-all.sh
+```
+
+The scripts only add files to the sink. They never delete anything. Delete the files in `otel-data/received` yourself when you want to start clean.
+
 ## Load test ledger
 
 For the load test of `nginx/loadtest` (see `nginx/README.md`) the sink keeps a ledger of test events in memory. The requests are `GET /otelfwd-test/<thread>/<count>/<sent_ns>`. The `url.path` attribute of an access log record carries the three numbers. OTLP requests which contain such records are answered with 200 and are **not** written to a file or printed for every request (a summary line appears every 5 seconds). Other OTLP requests are stored as before.
@@ -197,72 +247,54 @@ curl -s http://127.0.0.1:4318/test/stats
 
 The sink handles every connection in its own thread. The ledger has one mutex, which is held for the time of one request. It uses about 40 bytes per expected event.
 
-## Example scripts
+## Other ways to start the container
 
-The folder `examples` contains test scripts which use curl (and only standard tools, no `jq`). They need bash, so on Windows run them in WSL or Git Bash.
+`run.sh` is the simple way. These start the same container without it.
+
+### With Docker Compose directly
+
+This is what `run.sh` does. The image is built from the Dockerfile when it does not exist yet:
 
 ```bash
 cd tools/otel-sink
 
-bash examples/run-all.sh
+BUILDKIT_PROGRESS=plain OTEL_SINK_UID=$(id -u) OTEL_SINK_GID=$(id -g) docker compose up
 ```
 
-| Script              | What it does                                                                                        |
-| :------------------ | :-------------------------------------------------------------------------------------------------- |
-| `send-log.sh`       | Sends one log record. The smallest example: `bash examples/send-log.sh "message" 17`                |
-| `test-basic.sh`     | Health check, one POST, the file name, pretty printed JSON, another path                            |
-| `test-https.sh`     | HTTPS with the generated certificate, and the refusal without `--cacert` (curl exit code 60)        |
-| `test-token.sh`     | Bearer token: 401 without, with a wrong token, and 200 with the right one. Skipped without a token  |
-| `test-fail-port.sh` | The port which always fails: status code, nothing stored                                            |
-| `test-gzip.sh`      | Compressed request body is stored decompressed. A body which is not gzip gets 400                   |
-| `test-errors.sh`    | Binary body and broken JSON (stored as `.bin`), a PUT (405), a path with `..`                       |
-| `test-parallel.sh`  | 20 clients at the same time (`PARALLEL=50` for more): every request in its own file, numbers unique |
-| `test-large.sh`     | 3000 log records in one POST (`LARGE_RECORDS=10000`), and a 33 MB request which is refused with 413 |
-| `run-all.sh`        | Runs all tests and prints a summary                                                                 |
-
-Each script prints `PASS`, `FAIL` or `SKIP` per check and returns 0 when nothing failed. `run-all.sh` returns 2 when the sink is not reachable.
-
-The scripts are configured with environment variables. The defaults match the container as started by `docker compose up`:
-
-| Variable           | Description                                                                 | Default                     |
-| :----------------- | :-------------------------------------------------------------------------- | :-------------------------- |
-| `SINK_HOST`        | Address of the container                                                    | `127.0.0.1`                 |
-| `SINK_HTTP_PORT`   | OTLP/HTTP port                                                              | `4318`                      |
-| `SINK_HTTPS_PORT`  | OTLP/HTTPS port                                                             | `4319`                      |
-| `SINK_FAIL_PORT`   | The port which always fails                                                 | `4320`                      |
-| `SINK_TOKEN`       | Bearer token, when the container was started with `OTEL_SINK_TOKEN`         | none                        |
-| `SINK_FAIL_STATUS` | Status code of the failing port                                             | `503`                       |
-| `SINK_DATA_DIR`    | The `/data` volume on the host                                              | `tools/otel-sink/otel-data` |
-| `SINK_CONTAINER`   | Container name, used with `docker exec` when `SINK_DATA_DIR` does not exist | `otel-test-sink`            |
-
-The scripts check the received files in `SINK_DATA_DIR`, or with `docker exec` if that directory does not exist. Without access to the files, the checks on the files are skipped.
-Every run marks its records with its own id, so old files do not disturb a run.
+`BUILDKIT_PROGRESS=plain` prints the build log as plain text instead of the animated view. It is optional.
+Add `--build` to build the image again after changing the sources.
+`OTEL_SINK_UID` and `OTEL_SINK_GID` make the files belong to you. Without them the container runs with uid and gid 1000.
+The settings below can be passed the same way, or written into a file named `.env` next to `docker-compose.yml`:
 
 ```bash
-# the container was started with OTEL_SINK_TOKEN=secret
-SINK_TOKEN=secret bash examples/run-all.sh
-
-# a container on another host
-SINK_HOST=192.168.1.20 SINK_DATA_DIR=/nonexistent bash examples/run-all.sh
+OTEL_SINK_TOKEN=secret OTEL_SINK_UID=$(id -u) OTEL_SINK_GID=$(id -g) docker compose up
 ```
 
-The scripts only add files to the sink. They never delete anything. Delete the files in `otel-data/received` yourself when you want to start clean.
-
-## Use with otelfwd
+### Without Compose
 
 ```bash
-# HTTP
-OTLP_PUSH_API_URL=http://127.0.0.1:4318/v1/logs otelfwd ...
+BUILDKIT_PROGRESS=plain docker build -t otel-test-sink tools/otel-sink
 
-# HTTP with a token (container started with -e OTEL_SINK_TOKEN=secret)
-OTLP_PUSH_API_URL=http://127.0.0.1:4318/v1/logs OTLP_PUSH_TOKEN=secret otelfwd ...
+mkdir -p otel-data
 
-# HTTPS: trust the generated certificate
-OTLP_PUSH_API_URL=https://127.0.0.1:4319/v1/logs OTLP_CA_FILE=otel-data/certs/cert.pem otelfwd ...
-
-# Retry and WAL: this port always fails, the lines stay in the WAL until the endpoint is changed
-OTLP_PUSH_API_URL=http://127.0.0.1:4320/v1/logs otelfwd ...
+docker run --rm --name otel-test-sink --hostname otel-test-sink --user "$(id -u):$(id -g)" \
+  -p 127.0.0.1:4318:4318 -p 127.0.0.1:4319:4319 -p 127.0.0.1:4320:4320 \
+  -v "$PWD/otel-data:/data" otel-test-sink
 ```
+
+Without `--user` the container runs as user `otel` (uid 1000), which needs a volume it can write to.
+
+The container is named `otel-test-sink` and its host name is `otel-test-sink` as well (Docker would otherwise use the random container id). Other containers on the same Docker network reach it under that name, for example `https://otel-test-sink:4319/v1/logs`.
+
+## Shell in the container
+
+The image contains `bash`:
+
+```bash
+docker exec -it otel-test-sink bash
+```
+
+Useful places inside the container: `/data/received` (the files), `/data/nginx-access.log`, `/tmp/otel-sink/nginx.conf` (the NGINX configuration which is generated at start) and `/tmp/otel-sink/locations.conf`.
 
 ## Without Docker
 
