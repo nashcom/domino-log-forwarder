@@ -1,17 +1,17 @@
-# otelfwd - Log Forwarder for OpenTelemetry
+# domino-log-forwarder - HCL Domino logs and events for OpenTelemetry
 
-`otelfwd` is a helper program which takes log data from STDIN and from optional local socket inputs and pushes it as [OpenTelemetry](https://opentelemetry.io/) logs (OTLP/HTTP with JSON encoding) to an OpenTelemetry compatible endpoint.
+Forwards the logs and events of an [HCL Domino](https://www.hcl-software.com/domino) server to any [OpenTelemetry](https://opentelemetry.io/) compatible endpoint (OTLP/HTTP with JSON encoding), for example the [Grafana Loki OTLP endpoint](https://grafana.com/docs/loki/latest/send-data/otel/) or an OpenTelemetry Collector.
 
-Features:
+The repository has two programs which work together, and some tools to test them:
 
-* Pushes logs via OTLP/HTTP (JSON) to any OpenTelemetry compatible endpoint, for example the [Grafana Loki OTLP endpoint](https://grafana.com/docs/loki/latest/send-data/otel/) or an OpenTelemetry Collector
-* Annotates log lines using `pid.nbf` to provide the Domino server task name
-* Supports durable WAL based retry for push operations
-* Sends lines that are queued at the same time in one push request (up to 100 lines / 512 KB, never waits to fill a batch)
-* Optional socket inputs (UNIX socket, loopback TCP and a syslog datagram socket) to receive structured log records, for example from the Domino event add-in or NGINX
-* Can run standalone without reading STDIN (`-nostdin`), serving only its socket inputs
-* Writes the unmodified input to STDOUT or a defined log file
-* Writes a metrics file for Prometheus
+| Component                                       | What it is                                                                                                                              |
+| :---------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------- |
+| [`otelfwd`](#otelfwd---the-otel-forwarder)      | The forwarder. Reads the **Domino console log** from STDIN (`server \| otelfwd`) and structured records from local sockets, pushes OTLP |
+| [`domfwd`](domfwd/README.md)                    | Domino server add-in. Reads the **Domino events** (Event Monitoring queue) and sends one structured record per event to `otelfwd`       |
+| [`nginx/`](nginx/README.md)                     | Test NGINX container which logs via syslog into `otelfwd`, and the end to end load test                                                 |
+| [`tools/otel-sink/`](tools/otel-sink/README.md) | Test OTLP receiver container                                                                                                            |
+
+`otelfwd` is general purpose. Everything which can write a line of text or a JSON record to a local socket can use it, for example NGINX. The Domino specific parts are the console log annotation and `domfwd`.
 
 > **Version 2.0 only supports OTLP.**
 > The Loki push API and the Alloy output format of version 1.x have been removed.
@@ -20,31 +20,30 @@ Features:
 ## Overview
 
 ```text
-                       ┌── STDIN / Domino console
-                       │
-Domino event add-in ───┼── UNIX socket
-                       │
-other local producer ──┼── TCP 127.0.0.1
-                       │
-NGINX (syslog) ────────┼── UNIX datagram socket
-                       │
-                       ▼
-                    otelfwd
-                       │
-                       ├── batching
-                       ├── WAL / retry
-                       ├── resource/scope grouping
-                       └── OTLP/HTTP JSON
-                               │
-                               ▼
-                     any OTLP receiver
+Domino console (STDOUT) ─── STDIN ───────────┐
+                                             │
+domfwd (Domino events) ──── UNIX socket ─────┤
+                                             │
+other local producer ────── TCP 127.0.0.1 ───┤
+                                             │
+NGINX (syslog) ──────────── UNIX datagram ───┤
+                                             ▼
+                                          otelfwd
+                                             │
+                                             ├── batching
+                                             ├── WAL / retry
+                                             ├── resource/scope grouping
+                                             └── OTLP/HTTP JSON
+                                                     │
+                                                     ▼
+                                           any OTLP receiver
 ```
 
 Inputs:
 
-* **STDIN:** the log lines of a Domino server (`server | otelfwd`), annotated with the server task from `pid.nbf`.
+* **STDIN:** the console log of a Domino server (`server | otelfwd`), annotated with the server task from `pid.nbf`. See [Domino console log (STDOUT)](#domino-console-log-stdout).
+* **UNIX socket** and **TCP on 127.0.0.1:** structured records in the [flat record format](#records-received-via-socket-inputs) from other local programs, above all the Domino event add-in [`domfwd`](domfwd/README.md). TCP is loopback only. See [Domino events (domfwd)](#domino-events-domfwd).
 * **Syslog** (UNIX datagram socket, only if enabled): syslog messages, for example the access and error log of NGINX. See [Syslog input](#syslog-input).
-* **UNIX socket** and **TCP on 127.0.0.1:** structured records in the [flat record format](#records-received-via-socket-inputs) from other local programs, for example the Domino event add-in [`domfwd`](domfwd/README.md), which is part of this repository. TCP is loopback only.
 
 What `otelfwd` does with them:
 
@@ -52,6 +51,54 @@ What `otelfwd` does with them:
 * **WAL / retry:** a request which fails is written to a write ahead log and replayed when the receiver is back.
 * **Resource/scope grouping:** records with the same resource and scope share one `resourceLogs` entry.
 * **OTLP/HTTP JSON:** the requests go to the OTLP logs endpoint of any receiver, for example an OpenTelemetry Collector or Grafana Loki.
+* **Metrics:** writes a metrics file for Prometheus.
+
+## Domino console log (STDOUT)
+
+The console output of the Domino server is the first use case. The server writes its console log to STDOUT. Piping it into `otelfwd` sends every line to the OTLP endpoint, and the log stays where it was:
+
+```bash
+export OTLP_PUSH_API_URL=https://otel.example.com:4318/v1/logs
+export OTELFWD_OUTPUT_LOG=/local/notesdata/notes.log     # optional, see below
+
+/opt/hcl/domino/bin/server | otelfwd
+```
+
+* **One line, one record.** The line is the body, unchanged. Console lines carry no severity and no source time stamp, so the severity is unspecified and the time the line was read is used.
+* **Domino task name.** The process id in the line prefix (`[86261:000002-...]`) is looked up in `pid.nbf` and sent as attribute `domino.task` (for example `http`, `amgr`, `router`). The PID is sent as `process.pid`. Grafana Loki and similar backends can then filter by task. The complete list of attributes is in [Lines read from STDIN](#lines-read-from-stdin).
+* **Output log.** `OTELFWD_OUTPUT_LOG` writes the unmodified input to a log file, so there is no shell redirection and the log handling stays in the forwarder. `OTELFWD_MIRROR_STDOUT=1` writes it to STDOUT as well, for example for `docker logs`. Without `OTELFWD_OUTPUT_LOG` no log file is written. See [Output related configuration](#output-related-configuration).
+* **Nothing is lost when the receiver is down.** A failed push goes to the [WAL](#durable-log-delivery) and is replayed later. Lines read from STDIN are never dropped.
+* **The forwarder ends with the server.** It ends when STDIN is closed. Records which could not be pushed stay in the WAL for the next start. See [Pipe mode](#pipe-mode).
+
+Domino events (not the console text) are a different source, see the next section.
+
+## Domino events (domfwd)
+
+[`domfwd`](domfwd/README.md) is a Domino server add-in (server task) in this repository. It reads the events of the Domino event queue, the same source Domino Event Monitoring uses, and turns every event into one structured record: severity, event type, error code and text, add-in name, target database and more, with the process of the server as resource. This is information which is not in the console text.
+
+```text
+Domino server ── events ──► domfwd ── UNIX socket ──► otelfwd ──► OTLP receiver
+```
+
+* `domfwd` sends to the default UNIX socket of `otelfwd` (`<data>/domino/otelfwd.sock`) on Linux without any setting, so `load domfwd` next to a running `otelfwd` is enough.
+* The receiving `otelfwd` can run as a pipe (`server | otelfwd`, which also forwards the console log) or standalone (`otelfwd -nostdin`, see [Operating modes](#operating-modes)).
+* The event handling of the server has to post events to the event queue `domfwd`. Configuration, notes.ini settings, metrics, build instructions (needs the Domino C API toolkit) and status are in [domfwd/README.md](domfwd/README.md).
+* The record format `domfwd` sends is the [flat record format](#records-received-via-socket-inputs).
+
+## otelfwd - the OTel forwarder
+
+`otelfwd` takes log data from STDIN and from optional local socket inputs and pushes it as OpenTelemetry logs (OTLP/HTTP with JSON encoding). The rest of this document is its reference.
+
+Features:
+
+* Pushes logs via OTLP/HTTP (JSON) to any OpenTelemetry compatible endpoint
+* Annotates Domino console lines using `pid.nbf` with the Domino server task name
+* Supports durable WAL based retry for push operations
+* Sends lines that are queued at the same time in one push request (up to 100 lines / 512 KB, never waits to fill a batch)
+* Optional socket inputs (UNIX socket, loopback TCP and a syslog datagram socket) to receive structured log records, for example from the Domino event add-in or NGINX
+* Can run standalone without reading STDIN (`-nostdin`), serving only its socket inputs
+* Writes the unmodified input to STDOUT or a defined log file
+* Writes a metrics file for Prometheus
 
 ## Operating modes
 
