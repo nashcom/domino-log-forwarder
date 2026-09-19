@@ -34,11 +34,20 @@ NGINX (syslog) ──────────── UNIX datagram ───┤
                                              ├── WAL / retry
                                              ├── resource/scope grouping
                                              └── OTLP/HTTP JSON
-                                                     │
+                                                     │  HTTP(S) over TCP, outbound
+                                                     │  URL from OTLP_PUSH_API_URL, OTLP default port 4318
                                                      ▼
                                            any OTLP receiver
                                         (tested with Grafana Loki)
 ```
+
+Network interfaces of `otelfwd`:
+
+| Direction | Interface                                           | Notes                                                                                                                                                                                                                           |
+| :-------- | :-------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| In        | STDIN, UNIX socket, syslog datagram socket          | Local only, no network                                                                                                                                                                                                          |
+| In        | TCP on loopback (`OTELFWD_TCP_LISTEN`)              | Loopback only. Off unless configured. No default port, the examples use `127.0.0.1:4390`                                                                                                                                        |
+| Out       | HTTP or HTTPS to the receiver (`OTLP_PUSH_API_URL`) | The only network connection. No default: the URL sets host and port (OTLP/HTTP standard: 4318, Loki: 3100). Use `https://` with `OTLP_CA_FILE` for a private CA and `OTLP_PUSH_TOKEN` for a bearer token. Needs outbound access |
 
 Inputs:
 
