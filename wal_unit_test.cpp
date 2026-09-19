@@ -10,8 +10,10 @@
    Everything happens in a private temporary directory. Every check prints [PASS] or [FAIL]. The end of the output has a
    section "Failed checks" (only if there are any) and a section "Result" with the overall status. The exit code is 0 if every check passed and 1 if any check failed.
 
-   Two groups of tests:
+   Groups of tests:
 
+   - Log lines: the format of the console output of otelfwd (log_line.hpp), which the WAL uses for its messages too:
+                the time stamp in UTC, the two blanks, the prefix, the level. And that the messages of the WAL have it
    - Behaviour: what the WAL is meant to do (order, partial replay, restart, concurrency, large records ...)
    - Findings:  one test for each problem which the code review found. They are named "[finding N]". A finding test fails
                 as long as the problem is not fixed, and passes once it is. The numbers are those of the review:
@@ -40,6 +42,7 @@
 #include <vector>
 
 #include "simple_wal.hpp"
+#include "log_line.hpp"
 
 
 /* Fault injection. The test is linked with -Wl,--wrap=ftruncate and -Wl,--wrap=unlink (see the makefile), so that every call
@@ -1606,6 +1609,164 @@ static void TestPerformance (size_t Records)
 }
 
 
+/* ============================== Log lines ============================== */
+
+
+/* The start of the text is "dddd-dd-ddTdd:dd:ddZ" and two blanks, with digits in place of the d. A check of the shape, which does
+   not use the code which makes it */
+static bool StartsWithTimestamp (const std::string& Text)
+{
+    static const char szShape[] = "dddd-dd-ddTdd:dd:ddZ  ";
+    size_t Len = sizeof (szShape) - 1;
+
+    if (Text.size() < Len)
+        return false;
+
+    for (size_t i = 0; i < Len; i++)
+    {
+        if ('d' == szShape[i])
+        {
+            if ( (Text[i] < '0') || (Text[i] > '9') )
+                return false;
+        }
+        else if (Text[i] != szShape[i])
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+/* The times are what the date command says for the same number of seconds: date -u -d @NUMBER */
+static void TestLogTime ()
+{
+    /* The time is UTC whatever the time zone of the host is. A zone 12 hours away shows a local time as a difference:
+       the POSIX form NZST-12 needs no time zone database on the host */
+    const char *pszOldZone = getenv ("TZ");
+    std::string OldZone    = pszOldZone ? pszOldZone : "";
+
+    ::setenv ("TZ", "NZST-12", 1);
+    ::tzset();
+
+    Check ("1970-01-01T00:00:00Z" == FormatLogTime (0),            "log time: 0 is the start of 1970 in UTC, also when the host time zone is 12 hours ahead");
+    Check ("2000-02-29T00:00:00Z" == FormatLogTime (951782400),    "log time: a leap day");
+    Check ("2026-09-19T21:07:09Z" == FormatLogTime (1789852029),   "log time: a time of today (the metrics timestamp of the WAL retry test)");
+    Check ("2030-01-01T00:00:00Z" == FormatLogTime (1893456000),   "log time: the start of a year");
+    Check ("2038-01-19T03:14:08Z" == FormatLogTime (2147483648LL), "log time: the second after the 32 bit limit");
+
+    if (pszOldZone)
+        ::setenv ("TZ", OldZone.c_str(), 1);
+    else
+        ::unsetenv ("TZ");
+
+    ::tzset();
+}
+
+
+static void TestLogLine ()
+{
+    Check ("1970-01-01T00:00:00Z  otelfwd: [Error] message: text\n" == FormatLogLine (0, "otelfwd", "Error", "message", "text"),
+           "log line: time, two blanks, process name, level, message, text");
+
+    Check ("1970-01-01T00:00:00Z  [Error] message: text\n" == FormatLogLine (0, NULL, "Error", "message", "text"),
+           "log line: without a process name (-nostdin) there is nothing before the level");
+
+    Check ("1970-01-01T00:00:00Z  [Error] message: text\n" == FormatLogLine (0, "", "Error", "message", "text"),
+           "log line: an empty process name is the same as none");
+
+    Check ("1970-01-01T00:00:00Z  otelfwd: message: text\n" == FormatLogLine (0, "otelfwd", NULL, "message", "text"),
+           "log line: without a level");
+
+    Check ("1970-01-01T00:00:00Z  otelfwd: [Warning] message\n" == FormatLogLine (0, "otelfwd", "Warning", "message", NULL),
+           "log line: without a text after the message");
+
+    Check ("1970-01-01T00:00:00Z  otelfwd: [Warning] message\n" == FormatLogLine (0, "otelfwd", "Warning", "message", ""),
+           "log line: an empty text is the same as none, there is no dangling colon");
+
+    Check ("1970-01-01T00:00:00Z  message\n" == FormatLogLine (0, NULL, NULL, "message", NULL),
+           "log line: only a message: time, two blanks, message");
+
+    Check ("1970-01-01T00:00:00Z  \n" == FormatLogLine (0, NULL, NULL, NULL, NULL),
+           "log line: no message at all does not crash");
+}
+
+
+/* What goes to stderr really: the time is now, and the line is one piece */
+static void TestLogOutput ()
+{
+    time_t Before = time (NULL);
+
+    SetLogPrefix ("otelfwd");
+
+    std::string Out = CaptureStderr ([] { WriteLogLine ("Error", "test message", "test text"); });
+
+    time_t After = time (NULL);
+
+    Check (StartsWithTimestamp (Out), "log output: the line starts with a time stamp and two blanks");
+    Check (Out.size() > 22 && "otelfwd: [Error] test message: test text\n" == Out.substr (22), "log output: the process name, the level, the message and the text follow");
+
+    struct tm Tm {};
+    bool bParsed = (NULL != ::strptime (Out.c_str(), "%Y-%m-%dT%H:%M:%SZ", &Tm));
+    time_t Logged = bParsed ? ::timegm (&Tm) : 0;
+
+    Check (bParsed && (Logged >= Before - 1) && (Logged <= After + 1), "log output: the time is the time of now, in UTC");
+
+    SetLogPrefix (NULL);
+
+    Out = CaptureStderr ([] { WriteLogLine (NULL, "plain message"); });
+    Check (StartsWithTimestamp (Out) && Out.size() > 22 && "plain message\n" == Out.substr (22), "log output: without a process name (-nostdin) the message follows the time stamp");
+
+    Out = CaptureStderr ([] { errno = ENOENT; WriteLogErrno ("Cannot open the file"); });
+    Check (Out.size() > 22 && "[Error] Cannot open the file: No such file or directory\n" == Out.substr (22), "log output: an error with errno has the text of the error, in the place of perror");
+}
+
+
+/* The messages of the WAL are lines of the same output */
+static void TestWalLogLines ()
+{
+    std::vector<std::string> Records;
+
+    SetLogPrefix ("otelfwd");
+
+    /* An error: the record was cut off by a crash. The unreadable bytes are moved to the .corrupt file */
+    std::string PathTorn = WalPath ("logtorn");
+
+    RemoveFiles (PathTorn);
+
+    SimpleWAL WalTorn;
+    WalTorn.Init (PathTorn);
+    AppendText (WalTorn, "good");
+
+    uint32_t Len = 100;
+    AppendBytes (PathTorn, &Len, sizeof (Len));
+    AppendBytes (PathTorn, "xx", 2);
+
+    std::string Out = CaptureStderr ([&] { ReplayAll (WalTorn, Records); });
+
+    Check (StartsWithTimestamp (Out), "WAL log line: an error message starts with a time stamp");
+    Check (std::string::npos != Out.find ("  otelfwd: [Error] WAL: unreadable data at offset "), "WAL log line: an error has the process name, the level [Error] and the text");
+
+    /* A warning: a commit position of an older WAL, behind the end of this one */
+    std::string PathStale = WalPath ("logstale");
+
+    RemoveFiles (PathStale);
+    WriteCommitFile (PathStale, 4096);
+
+    SimpleWAL WalStale;
+    WalStale.Init (PathStale);
+    AppendText (WalStale, "new record");
+
+    Out = CaptureStderr ([&] { ReplayAll (WalStale, Records); });
+
+    Check (StartsWithTimestamp (Out), "WAL log line: a warning message starts with a time stamp");
+    Check (std::string::npos != Out.find ("  otelfwd: [Warning] WAL: commit offset 4096 is behind the end of the WAL"), "WAL log line: a warning has the level [Warning]");
+
+    SetLogPrefix (NULL);
+}
+
+
 int main (int argc, char *argv[])
 {
     std::string Parent = "/tmp";
@@ -1645,6 +1806,12 @@ int main (int argc, char *argv[])
     Group ("WAL unit test");
     printf ("Working directory: %s\n", g_Dir.c_str());
     printf ("File system:       %s\n", FileSystemName (g_Dir).c_str());
+
+    Group ("Log lines: time stamp and format");
+    TestLogTime();
+    TestLogLine();
+    TestLogOutput();
+    TestWalLogLines();
 
     Group ("Behaviour");
     TestRoundTrip();

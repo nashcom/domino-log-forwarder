@@ -10,6 +10,7 @@
 #include <sys/stat.h>
 
 #include "simple_wal.hpp"
+#include "log_line.hpp"
 
 
 /* The files of the WAL contain log lines. Only the owner may access them */
@@ -60,7 +61,7 @@ void SimpleWAL::LogMessage (const char *pszMessage)
 
     if (m_LogLevel)
     {
-        fprintf (stderr, "%s\n", pszMessage);
+        WriteLogLine (NULL, pszMessage);
     }
 }
 
@@ -84,7 +85,7 @@ bool SimpleWAL::Init (const std::string& Path)
 
     if (m_fd < 0)
     {
-        perror ("open wal failed");
+        WriteLogErrno ("open wal failed");
         return false;
     }
 
@@ -156,7 +157,7 @@ bool SimpleWAL::Append (const void* pData, uint32_t Len)
 
         if (Start < 0)
         {
-            perror ("Cannot get the end of the WAL");
+            WriteLogErrno ("Cannot get the end of the WAL");
             return false;
         }
 
@@ -164,7 +165,7 @@ bool SimpleWAL::Append (const void* pData, uint32_t Len)
         {
             /* Do not leave a piece of the record behind (the disk is full, for example). Every record after it would be unreadable */
             if (::ftruncate (m_fd, Start) < 0)
-                perror ("Cannot remove the partial WAL record");
+                WriteLogErrno ("Cannot remove the partial WAL record");
 
             return false;
         }
@@ -199,7 +200,7 @@ bool SimpleWAL::ReplaySingleCommit (const std::function<bool (const std::vector<
 
     if (::lseek (fd, Offset, SEEK_SET) < 0)
     {
-        perror ("Cannot seek WAL file");
+        WriteLogErrno ("Cannot seek WAL file");
         goto Done;
     }
 
@@ -252,6 +253,7 @@ bool SimpleWAL::Replay (const std::function<bool (const std::vector<uint8_t>&)>&
     off_t FileSize = 0;
     bool bDidReplay = false;
     bool bEmpty     = false;
+    char szMessage[300] = {0};
 
     std::lock_guard<std::mutex> lock (m_mutex);
 
@@ -267,7 +269,7 @@ bool SimpleWAL::Replay (const std::function<bool (const std::vector<uint8_t>&)>&
 
     if (FileSize < 0)
     {
-        perror ("Cannot get the size of the WAL");
+        WriteLogErrno ("Cannot get the size of the WAL");
         ::close (fd);
         return false;
     }
@@ -276,8 +278,9 @@ bool SimpleWAL::Replay (const std::function<bool (const std::vector<uint8_t>&)>&
        file was not removed (for example a crash in between). Replay the WAL from the start */
     if (Offset > static_cast<uint64_t> (FileSize))
     {
-        fprintf (stderr, "WAL: Warning - commit offset %llu is behind the end of the WAL (%llu bytes). Replaying from the start\n",
-                 static_cast<unsigned long long> (Offset), static_cast<unsigned long long> (FileSize));
+        snprintf (szMessage, sizeof (szMessage), "WAL: commit offset %llu is behind the end of the WAL (%llu bytes). Replaying from the start",
+                  static_cast<unsigned long long> (Offset), static_cast<unsigned long long> (FileSize));
+        WriteLogLine ("Warning", szMessage);
 
         Offset    = 0;
         NewOffset = 0;
@@ -291,8 +294,9 @@ bool SimpleWAL::Replay (const std::function<bool (const std::vector<uint8_t>&)>&
     {
         if ( (Offset > 0) && (Offset < static_cast<uint64_t> (FileSize)) && (false == IsRecordBoundary (fd, Offset, static_cast<uint64_t> (FileSize))) )
         {
-            fprintf (stderr, "WAL: Warning - commit offset %llu is not the start of a record. Replaying from the start\n",
-                     static_cast<unsigned long long> (Offset));
+            snprintf (szMessage, sizeof (szMessage), "WAL: commit offset %llu is not the start of a record. Replaying from the start",
+                      static_cast<unsigned long long> (Offset));
+            WriteLogLine ("Warning", szMessage);
 
             Offset    = 0;
             NewOffset = 0;
@@ -328,7 +332,7 @@ bool SimpleWAL::Replay (const std::function<bool (const std::vector<uint8_t>&)>&
 
         if (ReadBytes < 0)
         {
-            perror ("Cannot read the WAL");
+            WriteLogErrno ("Cannot read the WAL");
             break;
         }
 
@@ -351,7 +355,8 @@ bool SimpleWAL::Replay (const std::function<bool (const std::vector<uint8_t>&)>&
         }
         catch (const std::bad_alloc&)
         {
-            fprintf (stderr, "WAL: Error - not enough memory for a record of %lu bytes\n", static_cast<unsigned long> (Len));
+            snprintf (szMessage, sizeof (szMessage), "WAL: not enough memory for a record of %lu bytes", static_cast<unsigned long> (Len));
+            WriteLogLine ("Error", szMessage);
             break;
         }
 
@@ -410,19 +415,19 @@ bool SimpleWAL::ClearInternal()
     if ( (::unlink (m_CommitPath.c_str()) < 0) && (ENOENT != errno) )
     {
         /* The WAL is left as it is. Truncating it now would leave a commit position behind which does not fit to the next records */
-        perror ("Cannot remove the commit file");
+        WriteLogErrno ("Cannot remove the commit file");
         return false;
     }
 
     if (::ftruncate (m_fd, 0) < 0)
     {
-        perror ("file truncate failed");
+        WriteLogErrno ("file truncate failed");
         return false;
     }
 
     if (::lseek (m_fd, 0, SEEK_SET) < 0)
     {
-        perror ("file seek failed");
+        WriteLogErrno ("file seek failed");
         return false;
     }
 
@@ -460,11 +465,12 @@ bool SimpleWAL::QuarantineTail (int fdWal, uint64_t From, uint64_t To)
 {
     uint8_t  Buffer[65536];
     uint64_t Pos = From;
+    char     szMessage[1200] = {0};
     int fdCorrupt = ::open (m_CorruptPath.c_str(), O_CREAT | O_APPEND | O_WRONLY, 0600);
 
     if (fdCorrupt < 0)
     {
-        perror ("Cannot open the file for unreadable WAL data");
+        WriteLogErrno ("Cannot open the file for unreadable WAL data");
         return false;
     }
 
@@ -479,7 +485,7 @@ bool SimpleWAL::QuarantineTail (int fdWal, uint64_t From, uint64_t To)
 
         if ( (ReadBytes <= 0) || (false == WriteAllToFd (fdCorrupt, Buffer, static_cast<size_t> (ReadBytes))) )
         {
-            perror ("Cannot copy unreadable WAL data");
+            WriteLogErrno ("Cannot copy unreadable WAL data");
             ::close (fdCorrupt);
             return false;
         }
@@ -489,8 +495,9 @@ bool SimpleWAL::QuarantineTail (int fdWal, uint64_t From, uint64_t To)
 
     ::close (fdCorrupt);
 
-    fprintf (stderr, "WAL: Error - unreadable data at offset %llu (%llu bytes) moved to %s\n",
-             static_cast<unsigned long long> (From), static_cast<unsigned long long> (To - From), m_CorruptPath.c_str());
+    snprintf (szMessage, sizeof (szMessage), "WAL: unreadable data at offset %llu (%llu bytes) moved to %s",
+              static_cast<unsigned long long> (From), static_cast<unsigned long long> (To - From), m_CorruptPath.c_str());
+    WriteLogLine ("Error", szMessage);
 
     return true;
 }
@@ -503,7 +510,7 @@ bool SimpleWAL::WriteAll (const void* pBuf, size_t Len)
 
     if (false == WriteAllToFd (m_fd, pBuf, Len))
     {
-        perror ("Cannot write to WAL");
+        WriteLogErrno ("Cannot write to WAL");
         return false;
     }
 
@@ -519,13 +526,15 @@ uint64_t SimpleWAL::LoadCommit()
 
     struct stat StatBuf;
     uint64_t Offset = 0;
+    char     szMessage[1200] = {0};
 
     /* The file is exactly one offset. Anything else is damaged (a write which was cut off, for example) and is not used:
        replaying the WAL from the start delivers a record twice at worst, and loses nothing */
     if ( (::fstat (fdCommit, &StatBuf) < 0) || (StatBuf.st_size != static_cast<off_t> (sizeof (Offset))) ||
          (sizeof (Offset) != static_cast<size_t> (::read (fdCommit, &Offset, sizeof (Offset)))) )
     {
-        fprintf (stderr, "WAL: Warning - ignoring the damaged commit file %s\n", m_CommitPath.c_str());
+        snprintf (szMessage, sizeof (szMessage), "WAL: ignoring the damaged commit file %s", m_CommitPath.c_str());
+        WriteLogLine ("Warning", szMessage);
         Offset = 0;
     }
 
@@ -541,7 +550,7 @@ bool SimpleWAL::StoreCommit (uint64_t Offset)
 
     if (fdCommit < 0)
     {
-        perror ("open commit failed");
+        WriteLogErrno ("open commit failed");
         return false;
     }
 
@@ -555,7 +564,7 @@ bool SimpleWAL::StoreCommit (uint64_t Offset)
 
     if (false == bWritten)
     {
-        perror ("Cannot write the commit file");
+        WriteLogErrno ("Cannot write the commit file");
     }
 
     if (m_bCommit)

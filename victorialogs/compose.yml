@@ -1,0 +1,20 @@
+services:
+
+  victorialogs:
+    image: victoriametrics/victoria-logs:latest
+    container_name: victorialogs
+    hostname: victorialogs
+    restart: always
+
+    ports:
+      - "9428:9428"
+
+    command:
+      - "-storageDataPath=/victoria-logs-data"
+      - "-retentionPeriod=30d"
+
+    volumes:
+      - victoria-logs-data:/victoria-logs-data
+
+volumes:
+  victoria-logs-data:

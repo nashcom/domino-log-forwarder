@@ -9,26 +9,30 @@ TARGET_TEST = wal_unit_test push_failover_test
 # Common sources
 WAL_SRC  = simple_wal.cpp
 WAL_HDR  = simple_wal.hpp
+PUSH_HDR = push_status.hpp push_failover.hpp otlp_protobuf.hpp
+LOG_HDR  = log_line.hpp
 
 # Targets which are not files. Without this a file named "test" would make "make test" do nothing
 .PHONY: all test clean
 
 all: $(TARGET)
 
-# Builds and runs the unit tests: the WAL, and the failover between two OTLP endpoints. All of them run, even if one fails
+# Builds and runs the unit tests: the WAL, and the push path (failover between two OTLP endpoints, JSON to protobuf converter).
+# All of them run, even if one fails
 test: $(TARGET_TEST)
 	@fail=0; for t in $(TARGET_TEST); do ./$$t || fail=1; done; exit $$fail
 
-otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR)
+otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(PUSH_HDR) $(LOG_HDR)
 	$(CXX) $(CXXFLAGS) -o $@ otelfwd.cpp $(WAL_SRC) $(LDFLAGS)
 
 # Unit test of the WAL module alone: no otelfwd, no network. Also measures the throughput of the WAL
 # --wrap lets the test make ftruncate and unlink fail on request (fault injection), without any test code in the WAL
-wal_unit_test: wal_unit_test.cpp $(WAL_SRC) $(WAL_HDR)
+wal_unit_test: wal_unit_test.cpp $(WAL_SRC) $(WAL_HDR) $(LOG_HDR)
 	$(CXX) $(CXXFLAGS) -pthread -Wl,--wrap=ftruncate -Wl,--wrap=unlink -o $@ wal_unit_test.cpp $(WAL_SRC)
 
-# Unit test of the decisions in push_failover.hpp: which OTLP endpoint gets a request. No network
-push_failover_test: push_failover_test.cpp push_failover.hpp push_status.hpp
+# Unit test of the decisions in push_failover.hpp (which OTLP endpoint gets a request) and of the converter in
+# otlp_protobuf.hpp (JSON to protobuf). No network. Needs the rapidjson headers
+push_failover_test: push_failover_test.cpp push_failover.hpp push_status.hpp otlp_protobuf.hpp
 	$(CXX) $(CXXFLAGS) -pthread -o $@ push_failover_test.cpp
 
 # Test tool: receiving end of the OTLP test container, see tools/otel-sink/. Not part of "all".

@@ -166,21 +166,40 @@ otelfwd -nostdin
 
 ## Log at start
 
-At every start `otelfwd` logs the configuration which is in use, to stderr, one line for each part. This is where to look first when logs do not arrive where they are expected:
+At every start `otelfwd` logs the configuration which is in use, to stderr, one setting for each line as `Name: value`. The names are the ones of `-cfg`. This is where to look first when logs do not arrive where they are expected:
 
 ```text
-otelfwd: Mode: pipe, reads STDIN and the socket inputs
-otelfwd: Data directory /local/notesdata, metrics file /local/notesdata/domino/stats/otelfwd.prom
-otelfwd: Push endpoint https://otel.example.com:4318/v1/logs (token set, CA file /local/notesdata/trusted_root.pem)
-otelfwd: Backup endpoint https://otel-b.example.com:4318/v1/logs. The primary is tried again every 60 seconds while the backup is in use
-otelfwd: WAL /local/notesdata/otelfwd.wal: 610 bytes of an earlier run are pending and will be replayed
-otelfwd: Resource: service.name domino, service.namespace domino, service.instance.id domino1
-otelfwd: Output log /local/notesdata/notes.log, mirrored to stdout
+2026-09-19T21:34:01Z  otelfwd: STDIN input: yes
+2026-09-19T21:34:01Z  otelfwd: Data Dir: /local/notesdata
+2026-09-19T21:34:01Z  otelfwd: Metrics File: /local/notesdata/domino/stats/otelfwd.prom
+2026-09-19T21:34:01Z  otelfwd: OTLP Push API URL: https://otel.example.com:4318/v1/logs
+2026-09-19T21:34:01Z  otelfwd: OTLP Push Encoding: json (Content-Type application/json)
+2026-09-19T21:34:01Z  otelfwd: OTLP Push Token: set
+2026-09-19T21:34:01Z  otelfwd: OTLP CA File: /local/notesdata/trusted_root.pem
+2026-09-19T21:34:01Z  otelfwd: OTLP Push API URL Backup: https://otel-b.example.com:4318/v1/logs
+2026-09-19T21:34:01Z  otelfwd: OTLP Push Failback sec: 60
+2026-09-19T21:34:01Z  otelfwd: WAL File: /local/notesdata/otelfwd.wal
+2026-09-19T21:34:01Z  otelfwd: WAL Pending: 610 bytes of an earlier run, will be replayed
+2026-09-19T21:34:01Z  otelfwd: OTLP Push WAL Retry sec: 60
+2026-09-19T21:34:01Z  otelfwd: OTLP Service Name: domino
+2026-09-19T21:34:01Z  otelfwd: OTLP Service Namespace: domino
+2026-09-19T21:34:01Z  otelfwd: OTLP Service Instance: domino1
+2026-09-19T21:34:01Z  otelfwd: Output log: /local/notesdata/notes.log
+2026-09-19T21:34:01Z  otelfwd: Mirror to stdout: yes
+```
+
+Every line of the console output of `otelfwd` starts with the time in UTC (ISO 8601), followed by two blanks. Errors and warnings have their level in brackets, for example `[Error]`. This is also true for the messages of the WAL:
+
+```text
+2026-09-19T21:35:12Z  otelfwd: [Error] Curl operation failed: Failed to connect to localhost port 9428 after 0 ms: Could not connect to server
+2026-09-19T21:35:12Z  otelfwd: [Error] Cannot send the WAL to the receiver. Trying again in 60 seconds
 ```
 
 * **The values which are really used** are shown, after the checks of the configuration. If a setting was invalid and was replaced or ignored, an error line before these lines says so, and the summary shows the result, for example no backup endpoint.
 * **No secrets.** The token is only shown as `set` or `not set`. The URLs are shown without user name, password, query and fragment, because a URL can carry a secret there (`https://user:password@host/path?token=...`). `-cfg` and `-env` do the same.
-* Without `OTLP_PUSH_API_URL` the summary says that OTLP push is off. If the WAL cannot be opened, it says so instead of a WAL line.
+* Without `OTLP_PUSH_API_URL` the summary says that OTLP push is off and leaves out the settings of the push. The settings of the backup endpoint, `WAL Pending` and the output log are only there when they are used. If the WAL cannot be opened, the `WAL File` line says so.
+* With `-nostdin` the lines have no `otelfwd:` after the time. It is there in pipe mode, where the lines share the output with the mirrored lines of the server.
+* The mirrored lines of the server on stdout, the output log file, and the output of `-cfg` and `-help` have no time stamp.
 * `-cfg` shows everything, also the settings which are not set. See [Command line](#command-line).
 
 ## Environment Variables
@@ -220,6 +239,7 @@ The URL is the complete logs endpoint of the receiver. For the OpenTelemetry Col
 | `OTLP_PUSH_API_URL`        | OTLP/HTTP logs endpoint                                         | `https://otel.example.com:4318/v1/logs`   |
 | `OTLP_PUSH_API_URL_BACKUP` | Optional backup endpoint, see below                             | `https://otel-b.example.com:4318/v1/logs` |
 | `OTLP_PUSH_FAILBACK_SEC`   | Seconds between tries of the primary while the backup is in use | default: `60`                             |
+| `OTLP_PUSH_WAL_RETRY_SEC`  | Seconds to wait before the WAL is sent again after a failure    | default: `60`, see below                  |
 | `OTLP_PUSH_TOKEN`          | Bearer token for the endpoint                                   | `my-secure-token`                         |
 | `OTLP_CA_FILE`             | Trusted Root CA File                                            | `/local/notesdata/trusted_root.pem`       |
 | `OTLP_SERVICE_NAME`        | `service.name` resource attribute                               | default: `domino`                         |
@@ -310,6 +330,12 @@ The access log should use a JSON `log_format` with `escape=json` and OpenTelemet
 Failed log pushes are written to the WAL and replayed automatically once connectivity is restored.
 One WAL record is one push request, which can contain multiple log lines.
 The WAL file is `otelfwd.wal` in the data directory (`OTELFWD_DATA_DIR`).
+
+**When the WAL is sent.** The WAL is checked every second. If the receiver does not accept a record, the replay stops there. `otelfwd` logs `Cannot send the WAL to the receiver. Trying again in 60 seconds` and waits `OTLP_PUSH_WAL_RETRY_SEC` seconds (default 60, from 1 to 86400, up to a second more in practice) before the next try. An invalid value is reported at start and 60 is used. The value in use is in the log at start and in `-cfg`.
+
+* Records are sent in the order they were written. The position of the last accepted record is saved when a replay stops, so the next try continues there. When every record was sent, the WAL is emptied. Delivery is at least once: after a crash a record can be sent twice.
+* New log lines do not wait for the WAL. They are pushed at once, so after an outage they can arrive before the older lines, which keep their original time.
+* A replay which worked has no message of its own at the default log level. `otelfwd_push_retry_total{result="success"}` counts the records which were replayed.
 
 **What counts as delivered.** The HTTP status of the answer of the receiver decides what happens to a push request:
 
@@ -461,12 +487,12 @@ Both scripts print how many lines were pushed and return an error if the push fa
 
 ## Testing
 
-| Test                     | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                             |
-| :----------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| WAL unit test            | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, speed                                                                                                             |
-| Failover unit test       | `make test`                                                                                      | a C++ compiler and `make` | Which OTLP endpoint gets a request: the backup, the failback timing, refused data, threads ([details](#unit-test-of-the-failover))                                         |
-| Load test                | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                  |
-| Load test with an outage | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                    | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end)) |
+| Test                        | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                              |
+| :-------------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| WAL unit test               | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, speed. And the format of the log lines: time stamp, prefix, level                                                  |
+| Failover and converter test | `make test`                                                                                      | a C++ compiler and `make` | Which OTLP endpoint gets a request: the backup, the failback timing, refused data, threads. And the converter from JSON to protobuf ([details](#unit-test-of-the-failover)) |
+| Load test                   | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                   |
+| Load test with an outage    | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                    | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end))  |
 
 `--yes` in the commands of `run_loadtest.sh` means: do not ask for the size of the test. Without it, the script asks in a terminal for the number of threads and requests, and Enter takes the default (8 threads with 10,000 requests each). `./nginx/run_loadtest.sh --help` lists all options of the script and of the load test program.
 
@@ -478,7 +504,7 @@ Both scripts print how many lines were pushed and return an error if the push fa
 make test
 ```
 
-`make test` compiles the tests when a source changed, and runs them: this one and the [failover test](#unit-test-of-the-failover). All of them run even if one fails, and `make` ends with an error if a check failed. This test can also be started directly:
+`make test` compiles the tests when a source changed, and runs them: this one and the [failover and converter test](#unit-test-of-the-failover). All of them run even if one fails, and `make` ends with an error if a check failed. This test can also be started directly:
 
 ```bash
 ./wal_unit_test
@@ -511,21 +537,22 @@ Behaviour
 Result
 --------------------------------------------------------------------------------
 
-[PASS]  144 of 144 checks passed, 0 failed
+[PASS]  166 of 166 checks passed, 0 failed
 ```
 
 * `[PASS]` and `[FAIL]` mark every check. If something failed, a section **Failed checks** lists only those lines, before the section **Result**.
 * The last section, **Result**, is `[PASS]` only if every check passed. The exit code of the program is 0 then, and 1 otherwise.
-* The WAL writes warnings and errors to stderr, and some tests cause them on purpose, for example `WAL: Error - unreadable data at offset ... moved to ....corrupt` or `Cannot write to WAL: File too large`. They are not failures. Only a `[FAIL]` line is.
+* The WAL writes warnings and errors to stderr, and some tests cause them on purpose, for example `[Error] WAL: unreadable data at offset ... moved to ....corrupt` or `[Error] Cannot write to WAL: File too large`. They are not failures. Only a `[FAIL]` line is.
 
 #### What it tests
 
-| Section                | Names of the checks start with | What it covers                                                                                                                                                                                                                                                                                                                                                                      |
-| :--------------------- | :----------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Behaviour              | the name of the test           | Order of the records, partial replay and resuming it, no progress, empty records and a WAL which was not opened, restart, the destructor, `Clear()`, a 5 MB record, 10,000 records, four threads appending at once, one thread appending while another replays                                                                                                                      |
-| Findings of the review | `[finding N]`                  | Problems which a code review found. A replay must not get stuck at a commit position at or behind the end of the WAL, a record which was cut off by a crash, a damaged length or a partial header. A failed append leaves nothing behind. Files are only accessible for their owner, also old ones. A new WAL is silent. A commit file which is short, empty or too long is ignored |
-| Second review          | `[review 2]`                   | A commit position inside a record is not used: the WAL is replayed from the start. Failures while saving: the commit position cannot be written, the WAL cannot be truncated, the commit file cannot be removed, the unreadable part cannot be moved. A zero length is damage, not the end. The repaired state survives a restart. The sync option. Real crashes                    |
-| Performance            | `performance:`                 | Speed of appending, replaying and starting with a backlog, with a table and very low limits ([below](#performance-of-the-wal))                                                                                                                                                                                                                                                      |
+| Section                | Names of the checks start with                           | What it covers                                                                                                                                                                                                                                                                                                                                                                      |
+| :--------------------- | :------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Log lines              | `log time:`, `log line:`, `log output:`, `WAL log line:` | The console output of `otelfwd` (`log_line.hpp`), which the WAL uses for its messages too. The time is UTC in ISO 8601 (exact values from `date`, also when the host time zone is 12 hours ahead), then two blanks, the process name, the level, the message and a text. The line is written to stderr, and the messages of the WAL have it                                         |
+| Behaviour              | the name of the test                                     | Order of the records, partial replay and resuming it, no progress, empty records and a WAL which was not opened, restart, the destructor, `Clear()`, a 5 MB record, 10,000 records, four threads appending at once, one thread appending while another replays                                                                                                                      |
+| Findings of the review | `[finding N]`                                            | Problems which a code review found. A replay must not get stuck at a commit position at or behind the end of the WAL, a record which was cut off by a crash, a damaged length or a partial header. A failed append leaves nothing behind. Files are only accessible for their owner, also old ones. A new WAL is silent. A commit file which is short, empty or too long is ignored |
+| Second review          | `[review 2]`                                             | A commit position inside a record is not used: the WAL is replayed from the start. Failures while saving: the commit position cannot be written, the WAL cannot be truncated, the commit file cannot be removed, the unreadable part cannot be moved. A zero length is damage, not the end. The repaired state survives a restart. The sync option. Real crashes                    |
+| Performance            | `performance:`                                           | Speed of appending, replaying and starting with a backlog, with a table and very low limits ([below](#performance-of-the-wal))                                                                                                                                                                                                                                                      |
 
 The tests for failures use these techniques. None of them needs code for tests in the WAL:
 
@@ -576,6 +603,13 @@ The former program `wal_test` (a speed test without checks) is part of this test
 
 It checks: no backup, a working primary, the failover and that the backup stays in use, both endpoints failing, refused data (not sent to the other endpoint), the failback at exactly the configured time (not a second before), the immediate try of the primary when the backup fails, the statistics, and threads: when the probe of the primary is due and 8 threads send at the same second, exactly one of them makes it. The output has the same sections and `[PASS]` / `[FAIL]` lines as the WAL test.
 
+The same program tests the converter from JSON to protobuf (`otlp_protobuf.hpp`, used with `OTLP_PUSH_ENCODING=protobuf`). The expected bytes were worked out by hand from the OTLP protobuf definition and are written in hex in the test, with the structure in the spaces. It checks:
+
+* A record with all fields and all four types of values, the largest and the smallest int64, times as a string and as a number (also above the largest int64), a bool which is false, and members of the JSON in another order.
+* Text: non-ASCII characters, an empty string, a zero byte inside a string, and lengths above 127, which are written as two byte varints on every level.
+* The order of records and of `resourceLogs`, empty input, and that only the given length of the input is read.
+* What must be refused: broken JSON, more than one JSON value, a member or a type of value which the converter does not know, a value with two types, wrong types, and numbers which are out of range. An error returns no bytes, and the error text names the member.
+
 ### Test receiver and load test
 
 `tools/otel-sink` is a test container with an OTLP/HTTP receiver: NGINX in front (HTTP, HTTPS with a generated certificate, a bearer token check, a port which always fails) and a small program which writes every POST to its own JSON file.
@@ -611,8 +645,8 @@ Two options of the load test check the two endpoints of `otelfwd` with the same 
 ./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200
 ```
 
-* **`--wait` and `--stall` are both needed.** `otelfwd` waits about two minutes before it retries the WAL, and nothing arrives in that time. The test also stops when nothing new arrived for `--stall` seconds (default 15). With the default it gives up after 15 seconds and reports every event as missing, although they are still in the WAL.
-* **What to expect:** `RESULT: PASS`. The events arrive about two minutes after they were sent. In the block about `otelfwd`, `lines pushed ok / failed` shows all lines as failed, because the first push of every one failed, and `WAL requests replayed ok` is above 0. Duplicates are allowed (at least once).
+* **`--wait` and `--stall` are both needed.** `otelfwd` waits `OTLP_PUSH_WAL_RETRY_SEC` seconds (default 60) before it retries the WAL, and nothing arrives in that time. The test also stops when nothing new arrived for `--stall` seconds (default 15). With the default it gives up after 15 seconds and reports every event as missing, although they are still in the WAL.
+* **What to expect:** `RESULT: PASS`. The events arrive about a minute after they were sent (the wait of the WAL retry). In the block about `otelfwd`, `lines pushed ok / failed` shows all lines as failed, because the first push of every one failed, and `WAL requests replayed ok` is above 0. Duplicates are allowed (at least once).
 * The run takes a few minutes.
 
 ## Metrics

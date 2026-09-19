@@ -33,6 +33,10 @@
 #define OTELFWD_DEFAULT_FAILBACK_SEC          60
 #define OTELFWD_MAX_FAILBACK_SEC              86400
 
+/* How long the WAL thread waits after a failed replay before it sends the WAL again */
+#define OTELFWD_DEFAULT_WAL_RETRY_SEC         60
+#define OTELFWD_MAX_WAL_RETRY_SEC             86400
+
 /* A receiver which does not accept the connection in this time is treated as not reachable */
 #define OTELFWD_PUSH_CONNECT_TIMEOUT_SEC      3
 
@@ -43,6 +47,10 @@
 
 /* How much of the answer of the receiver is kept for the log */
 #define OTELFWD_PUSH_RESPONSE_MAX             512
+
+/* The format of a push request. The WAL always holds JSON. Protobuf is made from it just before a request is sent */
+#define OTELFWD_CONTENT_TYPE_JSON             "application/json"
+#define OTELFWD_CONTENT_TYPE_PROTOBUF         "application/x-protobuf"
 
 #define OTELFWD_VERSION_BUILD (OTELFWD_VERSION_MAJOR * 10000 +  OTELFWD_VERSION_MINOR * 100 + OTELFWD_VERSION_PATCH)
 
@@ -97,6 +105,8 @@
 #include "simple_wal.hpp"
 #include "push_status.hpp"
 #include "push_failover.hpp"
+#include "otlp_protobuf.hpp"
+#include "log_line.hpp"
 
 /* pid.nbf map definition */
 using PidMap = std::unordered_map<pid_t, std::string>;
@@ -247,7 +257,8 @@ private:
 /* One socket input (Unix socket or TCP). Each input runs in its own thread */
 struct IngestSource
 {
-    const char               *pszName;
+    const char               *pszName;              /* the name in the metrics (source="unix"). Do not change it */
+    const char               *pszTitle;             /* the name in the log messages: Unix, TCP, Syslog */
     bool                      bEnabled    = false;
     int                       fdListen    = -1;
     char                      szPath[1024] = {0};   /* Unix socket path. Removed when the input ends */
@@ -260,7 +271,7 @@ struct IngestSource
     std::atomic<std::int64_t> Connections {0};
     std::atomic<std::int64_t> Rejected    {0};
 
-    explicit IngestSource (const char *pszInputName) : pszName (pszInputName) {}
+    IngestSource (const char *pszInputName, const char *pszInputTitle) : pszName (pszInputName), pszTitle (pszInputTitle) {}
 };
 
 
@@ -281,6 +292,8 @@ char g_szEnvSocketQueueMax[]         = "OTELFWD_SOCKET_QUEUE_MAX";
 char g_szEnvOtlpPushApiUrl[]         = "OTLP_PUSH_API_URL";
 char g_szEnvOtlpPushApiUrlBackup[]   = "OTLP_PUSH_API_URL_BACKUP";
 char g_szEnvOtlpPushFailbackSec[]    = "OTLP_PUSH_FAILBACK_SEC";
+char g_szEnvOtlpPushWalRetrySec[]    = "OTLP_PUSH_WAL_RETRY_SEC";
+char g_szEnvOtlpPushEncoding[]       = "OTLP_PUSH_ENCODING";
 char g_szEnvOtlpPushToken[]          = "OTLP_PUSH_TOKEN";
 char g_szEnvOtlpCaFile[]             = "OTLP_CA_FILE";
 char g_szEnvOtlpServiceName[]        = "OTLP_SERVICE_NAME";
@@ -294,6 +307,8 @@ char g_szPidNbfFile[2048]        = {0};
 char g_szOtlpPushApiURL[1024]    = {0};
 char g_szOtlpPushApiURLBackup[1024] = {0};   /* optional second endpoint, used when the primary fails */
 size_t g_FailbackSec             = OTELFWD_DEFAULT_FAILBACK_SEC;
+size_t g_WalRetrySec             = OTELFWD_DEFAULT_WAL_RETRY_SEC;
+bool   g_bPushProtobuf           = false;   /* the format of push requests: false is JSON, true is protobuf */
 char g_szOtlpPushToken[1024]     = {0};
 char g_szOtlpCaFile[1024]        = {0};
 char g_szWalFile[2048]           = {0};
@@ -368,9 +383,9 @@ bool g_bWalOpened = false;      /* the result of opening it. Only used for the s
 PushFailover g_PushFailover;
 
 /* Socket inputs */
-IngestSource g_IngestUnix ("unix");
-IngestSource g_IngestTcp  ("tcp");
-IngestSource g_IngestSyslog ("syslog");
+IngestSource g_IngestUnix   ("unix",   "Unix");
+IngestSource g_IngestTcp    ("tcp",    "TCP");
+IngestSource g_IngestSyslog ("syslog", "Syslog");
 
 /* Statistic counters */
 std::atomic<std::int64_t> g_Metric_LogLines         {0};
@@ -378,7 +393,8 @@ std::atomic<std::int64_t> g_Metric_PushSuccess      {0};
 std::atomic<std::int64_t> g_Metric_PushErrors       {0};
 std::atomic<std::int64_t> g_Metric_PushRetrySuccess {0};
 std::atomic<std::int64_t> g_Metric_PushRetryErrors  {0};
-std::atomic<std::int64_t> g_Metric_PushRejected     {0};   /* push requests which the receiver refused as bad data (HTTP 400): dropped */
+std::atomic<std::int64_t> g_Metric_PushRejected     {0};   /* push requests which are dropped for good: the receiver refused them as bad data (HTTP 400), or they cannot be converted to protobuf */
+std::atomic<std::int64_t> g_Metric_PushConvertErrors {0};  /* the part of them which could not be converted to protobuf (only with OTLP_PUSH_ENCODING=protobuf) */
 
 /* Helper functions */
 
@@ -394,12 +410,13 @@ bool IsNullStr (const char *pszStr)
 }
 
 
+/* The console output of otelfwd: time, process name (pipe mode only), level, message. See log_line.hpp */
 void LogMessage (const char *pszMessage)
 {
     if (NULL == pszMessage)
         return;
 
-    fprintf (stderr, "%s: %s\n", g_szTask, pszMessage);
+    WriteLogLine (NULL, pszMessage);
 }
 
 void LogInfo (const char *pszMessage)
@@ -407,7 +424,7 @@ void LogInfo (const char *pszMessage)
     if (NULL == pszMessage)
         return;
 
-    fprintf (stderr, "%s\n", pszMessage);
+    WriteLogLine (NULL, pszMessage);
 }
 
 void LogError (const char *pszMessage)
@@ -415,7 +432,7 @@ void LogError (const char *pszMessage)
     if (IsNullStr (pszMessage))
         return;
 
-    fprintf (stderr, "%s: Error - %s\n", g_szTask, pszMessage);
+    WriteLogLine ("Error", pszMessage, NULL);
 }
 
 void LogError (const char *pszMessage, const char *pszErrorText)
@@ -429,7 +446,7 @@ void LogError (const char *pszMessage, const char *pszErrorText)
     }
     else
     {
-        fprintf (stderr, "%s: Error - %s: %s\n", g_szTask, pszMessage, pszErrorText);
+        WriteLogLine ("Error", pszMessage, pszErrorText);
     }
 }
 
@@ -592,7 +609,7 @@ bool LoadPidMap (const char * pszPidFile, PidMap& pidMap)
 
     if (!file.is_open())
     {
-        std::cerr << "failed to open pid file: " << pszPidFile << "\n";
+        LogError ("Cannot open the pid file", pszPidFile);
         return false;
     }
 
@@ -1283,8 +1300,64 @@ static void LogPushStatus (PushAction Action, long HttpCode, const std::string& 
 }
 
 
-/* Posts a JSON payload to the OTLP/HTTP logs endpoint. What the answer means is decided by GetPushAction (push_status.hpp) */
-PushAction SendPushPayload (CURL* pCurl, const char *pszURL, const char *pszPushToken, const char *pszCaFile, const char* pszBuffer, size_t BufferLen, long TimeoutSec)
+/* The value of OTLP_PUSH_ENCODING: json or protobuf, in any case. Returns false for any other text */
+static bool ParsePushEncoding (const char *pszValue, bool& retProtobuf)
+{
+    if (0 == strcasecmp (pszValue, "json"))
+    {
+        retProtobuf = false;
+        return true;
+    }
+
+    if (0 == strcasecmp (pszValue, "protobuf"))
+    {
+        retProtobuf = true;
+        return true;
+    }
+
+    return false;
+}
+
+
+/* A number of seconds from 1 to MaxValue, and nothing else after the number. Returns false for any other text */
+static bool ParseSecondsSetting (const char *pszValue, long MaxValue, size_t& retSeconds)
+{
+    char *pEnd  = NULL;
+    long  Value = strtol (pszValue, &pEnd, 10);
+
+    if ( (pEnd == pszValue) || ('\0' != *pEnd) || (Value < 1) || (Value > MaxValue) )
+        return false;
+
+    retSeconds = static_cast<size_t> (Value);
+    return true;
+}
+
+
+static const char *GetPushEncodingName()
+{
+    return g_bPushProtobuf ? "protobuf" : "json";
+}
+
+
+/* A request which cannot be converted is dropped. A converter which fails for every request would make a message for every
+   request: at most one every 10 seconds. The counter shows how many there were */
+static void LogConvertError (const std::string& Error)
+{
+    static std::atomic<time_t> tLastLogged {0};
+
+    time_t tNow  = time (NULL);
+    time_t tLast = tLastLogged.load();
+
+    if ( (tNow - tLast < 10) || (false == tLastLogged.compare_exchange_strong (tLast, tNow)) )
+        return;
+
+    LogError ("A push request cannot be converted from JSON to protobuf. The data is dropped", Error.c_str());
+}
+
+
+/* Posts a payload to the OTLP/HTTP logs endpoint, in the format which the content type names.
+   What the answer means is decided by GetPushAction (push_status.hpp) */
+PushAction SendPushPayload (CURL* pCurl, const char *pszURL, const char *pszPushToken, const char *pszCaFile, const char *pszContentType, const char* pszBuffer, size_t BufferLen, long TimeoutSec)
 {
     PushAction Action = PUSH_RETRY;
     char szErrorBuffer[CURL_ERROR_SIZE+10] = {0};
@@ -1310,7 +1383,7 @@ PushAction SendPushPayload (CURL* pCurl, const char *pszURL, const char *pszPush
 
     curl_easy_reset (pCurl);
 
-    pHeaders = curl_slist_append (pHeaders, "Content-Type: application/json");
+    pHeaders = curl_slist_append (pHeaders, (std::string ("Content-Type: ") + pszContentType).c_str());
     curl_easy_setopt (pCurl, CURLOPT_HTTPHEADER, pHeaders);
     curl_easy_setopt (pCurl, CURLOPT_POST, 1L);
     curl_easy_setopt (pCurl, CURLOPT_TIMEOUT, TimeoutSec);
@@ -1368,18 +1441,43 @@ Done:
 
 /* Sends one push request to the endpoint which g_PushFailover chooses: the primary, or the backup while the primary fails.
    The token and the CA file are the same for both. A change of the endpoint in use is logged: it is the one message an
-   admin needs to see that the traffic moved */
+   admin needs to see that the traffic moved.
+
+   The buffer is JSON, the format of the WAL. With OTLP_PUSH_ENCODING=protobuf it is converted here, once, before the failover
+   logic: both endpoints and the try of the primary get the same bytes. A request which cannot be converted is dropped for good
+   (PUSH_REJECTED, like data which the receiver refuses): trying again can not change the result, and it would block the WAL */
 PushAction SendPushRequest (CURL* pCurl, const char* pszBuffer, size_t BufferLen)
 {
     int  SwitchedTo = -1;
     char szMessage[2200] = {0};
+
+    std::string Converted;
+    const char *pszBody        = pszBuffer;
+    size_t      BodyLen        = BufferLen;
+    const char *pszContentType = OTELFWD_CONTENT_TYPE_JSON;
+
+    if (g_bPushProtobuf)
+    {
+        std::string Error;
+
+        if (false == ConvertOtlpJsonToProtobuf (pszBuffer, BufferLen, Converted, Error))
+        {
+            g_Metric_PushConvertErrors.fetch_add (1, std::memory_order_relaxed);
+            LogConvertError (Error);
+            return PUSH_REJECTED;
+        }
+
+        pszBody        = Converted.data();
+        BodyLen        = Converted.size();
+        pszContentType = OTELFWD_CONTENT_TYPE_PROTOBUF;
+    }
 
     PushAction Action = g_PushFailover.Send ([&] (PushEndpoint Endpoint, bool bProbe)
     {
         const char *pszURL = (PUSH_PRIMARY == Endpoint) ? g_szOtlpPushApiURL : g_szOtlpPushApiURLBackup;
         long TimeoutSec    = bProbe ? OTELFWD_PUSH_PROBE_TIMEOUT_SEC : OTELFWD_PUSH_TIMEOUT_SEC;
 
-        return SendPushPayload (pCurl, pszURL, g_szOtlpPushToken, g_szOtlpCaFile, pszBuffer, BufferLen, TimeoutSec);
+        return SendPushPayload (pCurl, pszURL, g_szOtlpPushToken, g_szOtlpCaFile, pszContentType, pszBody, BodyLen, TimeoutSec);
     }, time (NULL), &SwitchedTo);
 
     if (PUSH_BACKUP == SwitchedTo)
@@ -1416,7 +1514,7 @@ void *PushThread (void *arg)
         pCurl = curl_easy_init();
         if (!pCurl)
         {
-            std::cerr << "curl_easy_init failed\n";
+            LogError ("curl_easy_init failed");
             goto Done;
         }
     }
@@ -1511,7 +1609,7 @@ bool PushWalEntries()
 
     if (!pCurl)
     {
-        std::cerr << "curl_easy_init failed\n";
+        LogError ("curl_easy_init failed");
         return false;
     }
 
@@ -1563,8 +1661,12 @@ void *WalThread (void *arg)
 
             if (false == PushWalEntries())
             {
-                LogError ("PushWalEntries failed - Waiting 120 seconds");
-                if (IdleDelay (120))
+                char szMessage[200] = {0};
+
+                snprintf (szMessage, sizeof (szMessage), "Cannot send the WAL to the receiver. Trying again in %lu seconds", static_cast<unsigned long> (g_WalRetrySec));
+                LogError (szMessage);
+
+                if (IdleDelay (g_WalRetrySec))
                 {
                     break;
                 }
@@ -1685,7 +1787,7 @@ void *IngestThread (void *arg)
 
     if (g_LogLevel)
     {
-        snprintf (szMessage, sizeof (szMessage), "%s input thread started", pSource->pszName);
+        snprintf (szMessage, sizeof (szMessage), "%s input thread started", pSource->pszTitle);
         LogMessage (szMessage);
     }
 
@@ -1795,7 +1897,7 @@ void *IngestThread (void *arg)
 
     if (g_LogLevel)
     {
-        snprintf (szMessage, sizeof (szMessage), "%s input thread ended", pSource->pszName);
+        snprintf (szMessage, sizeof (szMessage), "%s input thread ended", pSource->pszTitle);
         LogMessage (szMessage);
     }
 
@@ -2095,7 +2197,7 @@ void *SyslogThread (void *arg)
 
     if (g_LogLevel)
     {
-        snprintf (szMessage, sizeof (szMessage), "%s input thread started", pSource->pszName);
+        snprintf (szMessage, sizeof (szMessage), "%s input thread started", pSource->pszTitle);
         LogMessage (szMessage);
     }
 
@@ -2149,7 +2251,7 @@ void *SyslogThread (void *arg)
 
     if (g_LogLevel)
     {
-        snprintf (szMessage, sizeof (szMessage), "%s input thread ended", pSource->pszName);
+        snprintf (szMessage, sizeof (szMessage), "%s input thread ended", pSource->pszTitle);
         LogMessage (szMessage);
     }
 
@@ -2268,7 +2370,7 @@ bool CreateUnixListener (IngestSource *pSource, const char *pszPath, mode_t Mode
     {
         char szMsg[1200] = {0};
 
-        snprintf (szMsg, sizeof (szMsg), "Input %s: Unix %s socket %s", pSource->pszName, (SOCK_DGRAM == SockType) ? "datagram" : "stream", pszPath);
+        snprintf (szMsg, sizeof (szMsg), "Input %s: Unix %s socket %s", pSource->pszTitle, (SOCK_DGRAM == SockType) ? "datagram" : "stream", pszPath);
         LogMessage (szMsg);
     }
 
@@ -2373,7 +2475,7 @@ bool CreateTcpListener (IngestSource *pSource, const char *pszSpec)
     {
         char szMsg[512] = {0};
 
-        snprintf (szMsg, sizeof (szMsg), "Input %s: TCP %s", pSource->pszName, pszSpec);
+        snprintf (szMsg, sizeof (szMsg), "Input %s: TCP %s", pSource->pszTitle, pszSpec);
         LogMessage (szMsg);
     }
 
@@ -2500,7 +2602,11 @@ bool WriteMetrics (bool bShutdown = false)
     WriteStatsEntryToFile (fp, g_Metric_PushRetrySuccess.load (std::memory_order_relaxed), "push_retry_total{result=\"success\"}");
     WriteStatsEntryToFile (fp, g_Metric_PushRetryErrors.load (std::memory_order_relaxed),  "push_retry_total{result=\"error\"}");
 
-    WriteStatsEntryToFileWithHelp (fp, g_Metric_PushRejected.load (std::memory_order_relaxed), "push_rejected_total", g_szPromTypeCounter, "Total number of push requests which the receiver refused as bad data (HTTP 400). They are dropped, not kept in the WAL");
+    WriteStatsEntryToFileWithHelp (fp, g_Metric_PushRejected.load (std::memory_order_relaxed), "push_rejected_total", g_szPromTypeCounter, "Total number of push requests which are dropped for good, not kept in the WAL: the receiver refused them as bad data (HTTP 400), or they could not be converted to protobuf");
+
+    /* Only with protobuf. These are also counted in push_rejected_total */
+    if (g_bPushProtobuf)
+        WriteStatsEntryToFileWithHelp (fp, g_Metric_PushConvertErrors.load (std::memory_order_relaxed), "push_convert_errors_total", g_szPromTypeCounter, "Total number of push requests which could not be converted from JSON to protobuf. They are dropped, and counted in push_rejected_total too");
 
     /* Only with a backup endpoint */
     if (g_PushFailover.HasBackup())
@@ -2635,65 +2741,109 @@ std::string SanitizeUrlForLog (const char *pszURL)
 }
 
 
-/* Logs the configuration which is in use, once at every start: where the data goes, where the WAL is, what is switched on.
-   The effective values are shown, after the checks of the configuration. No secrets: the token is only shown as set or not set,
-   and the URLs are without user name, password and query. -cfg shows everything on request */
+/* One line of the summary at start: "Name: value". The names are those of -cfg */
+static void LogSetting (const char *pszName, const std::string& Value)
+{
+    LogMessage ((std::string (pszName) + ": " + Value).c_str());
+}
+
+
+/* Logs the configuration which is in use, once at every start, one setting for each line as "Name: value" (the names of -cfg).
+   This is where to look first when logs do not arrive where they are expected. The effective values are shown, after the checks
+   of the configuration. No secrets: the token is only shown as set or not set, and the URLs are without user name, password
+   and query. -cfg shows everything on request */
 void LogStartupSummary (bool bWalOpened)
 {
-    char szMessage[4300] = {0};
-
-    snprintf (szMessage, sizeof (szMessage), "Mode: %s", g_NoStdin ? "standalone (-nostdin), serves the socket inputs" : "pipe, reads STDIN and the socket inputs");
-    LogMessage (szMessage);
-
-    snprintf (szMessage, sizeof (szMessage), "Data directory %s, metrics file %s", g_szDataDir, g_szMetricsFileName);
-    LogMessage (szMessage);
+    LogSetting ("STDIN input",  g_NoStdin ? "no (-nostdin)" : "yes");
+    LogSetting ("Data Dir",     g_szDataDir);
+    LogSetting ("Metrics File", g_szMetricsFileName);
 
     if (IsNullStr (g_szOtlpPushApiURL))
     {
-        LogMessage ("OTLP push is off: OTLP_PUSH_API_URL is not set. The log lines are not pushed");
+        LogSetting ("OTLP Push API URL", "not set. OTLP push is off, the log lines are not pushed");
     }
     else
     {
-        snprintf (szMessage, sizeof (szMessage), "Push endpoint %s (token %s, CA file %s)", SanitizeUrlForLog (g_szOtlpPushApiURL).c_str(),
-                  IsNullStr (g_szOtlpPushToken) ? "not set" : "set", IsNullStr (g_szOtlpCaFile) ? "not set" : g_szOtlpCaFile);
-        LogMessage (szMessage);
+        LogSetting ("OTLP Push API URL", SanitizeUrlForLog (g_szOtlpPushApiURL));
+
+        /* The format is for the primary and the backup endpoint */
+        LogSetting ("OTLP Push Encoding", std::string (GetPushEncodingName()) + " (Content-Type " + (g_bPushProtobuf ? OTELFWD_CONTENT_TYPE_PROTOBUF : OTELFWD_CONTENT_TYPE_JSON) + ")");
+
+        LogSetting ("OTLP Push Token", IsNullStr (g_szOtlpPushToken) ? "not set" : "set");
+        LogSetting ("OTLP CA File",    IsNullStr (g_szOtlpCaFile) ? "not set" : g_szOtlpCaFile);
 
         if (false == IsNullStr (g_szOtlpPushApiURLBackup))
         {
-            snprintf (szMessage, sizeof (szMessage), "Backup endpoint %s. The primary is tried again every %lu seconds while the backup is in use",
-                      SanitizeUrlForLog (g_szOtlpPushApiURLBackup).c_str(), static_cast<unsigned long> (g_FailbackSec));
-            LogMessage (szMessage);
+            LogSetting ("OTLP Push API URL Backup", SanitizeUrlForLog (g_szOtlpPushApiURLBackup));
+            LogSetting ("OTLP Push Failback sec",   std::to_string (static_cast<unsigned long> (g_FailbackSec)));
         }
 
         if (bWalOpened)
         {
             struct stat WalStat {};
 
+            LogSetting ("WAL File", g_szWalFile);
+
             if ( (0 == stat (g_szWalFile, &WalStat)) && (WalStat.st_size > 0) )
-                snprintf (szMessage, sizeof (szMessage), "WAL %s: %lld bytes of an earlier run are pending and will be replayed", g_szWalFile, static_cast<long long> (WalStat.st_size));
-            else
-                snprintf (szMessage, sizeof (szMessage), "WAL %s", g_szWalFile);
+                LogSetting ("WAL Pending", std::to_string (static_cast<long long> (WalStat.st_size)) + " bytes of an earlier run, will be replayed");
+
+            LogSetting ("OTLP Push WAL Retry sec", std::to_string (static_cast<unsigned long> (g_WalRetrySec)));
         }
         else
         {
-            snprintf (szMessage, sizeof (szMessage), "WAL %s cannot be opened: failed pushes cannot be kept", g_szWalFile);
+            LogSetting ("WAL File", std::string (g_szWalFile) + " (cannot be opened, failed pushes cannot be kept)");
         }
-
-        LogMessage (szMessage);
     }
 
-    snprintf (szMessage, sizeof (szMessage), "Resource: service.name %s, service.namespace %s, service.instance.id %s",
-              g_szOtlpServiceName, g_szServiceNamespace, g_szServiceInstanceId);
-    LogMessage (szMessage);
+    LogSetting ("OTLP Service Name",      g_szOtlpServiceName);
+    LogSetting ("OTLP Service Namespace", g_szServiceNamespace);
+    LogSetting ("OTLP Service Instance",  g_szServiceInstanceId);
 
-    if ( (0 == g_NoStdin) && (false == IsNullStr (g_szOutputLogFile)) )
+    if (0 == g_NoStdin)
     {
-        snprintf (szMessage, sizeof (szMessage), "Output log %s%s", g_szOutputLogFile, g_Mirror2Stdout ? ", mirrored to stdout" : "");
-        LogMessage (szMessage);
+        if (false == IsNullStr (g_szOutputLogFile))
+            LogSetting ("Output log", g_szOutputLogFile);
+
+        if (g_Mirror2Stdout)
+            LogSetting ("Mirror to stdout", "yes");
     }
-    else if ( (0 == g_NoStdin) && g_Mirror2Stdout )
+}
+
+
+/* Checks OTLP_PUSH_ENCODING at start. The value was read before (see main): an invalid one is reported, and json is used.
+   It must not end the program: in pipe mode the server would write into a closed pipe */
+void ValidatePushEncoding()
+{
+    const char *pEncoding = getenv (g_szEnvOtlpPushEncoding);
+    bool        bProtobuf = false;
+    char        szMessage[300] = {0};
+
+    if ( (NULL == pEncoding) || ('\0' == *pEncoding) )
+        return;
+
+    if (false == ParsePushEncoding (pEncoding, bProtobuf))
     {
-        LogMessage ("STDIN is mirrored to stdout");
+        snprintf (szMessage, sizeof (szMessage), "%s has to be json or protobuf. Using json", g_szEnvOtlpPushEncoding);
+        LogError (szMessage, pEncoding);
+    }
+}
+
+
+/* Checks OTLP_PUSH_WAL_RETRY_SEC at start. The value was read before (see main): an invalid one is reported, and the default is used */
+void ValidateWalRetryConfig()
+{
+    const char *pValue = getenv (g_szEnvOtlpPushWalRetrySec);
+    size_t      Seconds = 0;
+    char        szMessage[300] = {0};
+
+    if ( (NULL == pValue) || ('\0' == *pValue) )
+        return;
+
+    if (false == ParseSecondsSetting (pValue, OTELFWD_MAX_WAL_RETRY_SEC, Seconds))
+    {
+        snprintf (szMessage, sizeof (szMessage), "%s has to be a number of seconds from 1 to %d. Using the default of %d seconds",
+                  g_szEnvOtlpPushWalRetrySec, OTELFWD_MAX_WAL_RETRY_SEC, OTELFWD_DEFAULT_WAL_RETRY_SEC);
+        LogError (szMessage, pValue);
     }
 }
 
@@ -2863,6 +3013,8 @@ void PrintHelp ()
     LogHelpEnv (g_szEnvOtlpPushApiUrl,        "OTLP/HTTP logs push URL (example: https://otel.example.com:4318/v1/logs)");
     LogHelpEnv (g_szEnvOtlpPushApiUrlBackup,  "Optional backup OTLP/HTTP logs push URL, used when the push URL fails. Same token and CA file");
     LogHelpEnv (g_szEnvOtlpPushFailbackSec,   "Seconds between attempts to use the push URL again while the backup is in use (default: 60 sec)");
+    LogHelpEnv (g_szEnvOtlpPushWalRetrySec,   "Seconds to wait before the WAL is sent again after the receiver did not accept it (default: 60 sec)");
+    LogHelpEnv (g_szEnvOtlpPushEncoding,     "Format of the push requests: json or protobuf (default: json). Use protobuf for receivers which do not take JSON, like VictoriaLogs. The WAL is JSON either way");
     LogHelpEnv (g_szEnvOtlpPushToken,         "OTLP Push Token (bearer token)");
     LogHelpEnv (g_szEnvOtlpCaFile,            "OTLP Trusted Root CA File");
     LogHelpEnv (g_szEnvOtlpServiceName,       "OTLP service.name (default: domino)");
@@ -2962,6 +3114,8 @@ void DumpConfig (bool bShowEnvVars = false)
     LogCfgText (bShowEnvVars, "OTLP Push API URL",       SanitizeUrlForLog (g_szOtlpPushApiURL).c_str(),       g_szEnvOtlpPushApiUrl);
     LogCfgText (bShowEnvVars, "OTLP Push API URL Backup", SanitizeUrlForLog (g_szOtlpPushApiURLBackup).c_str(), g_szEnvOtlpPushApiUrlBackup);
     LogCfgNum  (bShowEnvVars, "OTLP Push Failback sec",  g_FailbackSec,        g_szEnvOtlpPushFailbackSec);
+    LogCfgNum  (bShowEnvVars, "OTLP Push WAL Retry sec", g_WalRetrySec,        g_szEnvOtlpPushWalRetrySec);
+    LogCfgText (bShowEnvVars, "OTLP Push Encoding",     GetPushEncodingName(), g_szEnvOtlpPushEncoding);
     LogCfgText (bShowEnvVars, "OTLP Push Token",         g_szOtlpPushToken[0] ? "(set)" : "", g_szEnvOtlpPushToken);
     LogCfgText (bShowEnvVars, "OTLP CA File",            g_szOtlpCaFile,       g_szEnvOtlpCaFile);
     LogCfgText (bShowEnvVars, "OTLP Service Name",       g_szOtlpServiceName,  g_szEnvOtlpServiceName);
@@ -3016,6 +3170,19 @@ void WriteEnvironment (int fd, const char* pszHeader)
 }
 
 
+/* pthread_create returns the error number. It does not set errno, so perror would show the wrong reason */
+static bool CreateThread (pthread_t *pThread, void *(*pFunction) (void *), void *pArgument)
+{
+    int rc = pthread_create (pThread, NULL, pFunction, pArgument);
+
+    if (0 == rc)
+        return true;
+
+    LogError ("Cannot create a thread (pthread_create)", strerror (rc));
+    return false;
+}
+
+
 int main (int argc, char *argv[])
 {
     int a   = 0;
@@ -3024,6 +3191,7 @@ int main (int argc, char *argv[])
 
     char    *pLine       = NULL;
     size_t  CountSeconds = 0;
+    char    szThreadMessage[300] = {0};
     size_t  len          = 0;
     size_t  seconds      = 0;
     ssize_t nread        = 0;
@@ -3031,6 +3199,9 @@ int main (int argc, char *argv[])
     int     ExitCode     = 0;
 
     struct sigaction sa {};
+
+    /* The lines of the console output start with the name of the process. Not with -nostdin, see below and log_line.hpp */
+    SetLogPrefix (g_szTask);
 
     sa.sa_handler = handle_signal;
     sigemptyset (&sa.sa_mask);
@@ -3100,6 +3271,16 @@ int main (int argc, char *argv[])
         if ( (*pEnd == '\0') && (Value >= 1) && (Value <= OTELFWD_MAX_FAILBACK_SEC) )
             g_FailbackSec = static_cast<size_t> (Value);
     }
+
+    /* An invalid value is reported at start (ValidateWalRetryConfig) and the default is used */
+    p = getenv (g_szEnvOtlpPushWalRetrySec);
+    if (p && *p)
+        ParseSecondsSetting (p, OTELFWD_MAX_WAL_RETRY_SEC, g_WalRetrySec);
+
+    /* An invalid value is reported at start (ValidatePushEncoding) and json is used */
+    p = getenv (g_szEnvOtlpPushEncoding);
+    if (p && *p)
+        ParsePushEncoding (p, g_bPushProtobuf);
 
     p = getenv (g_szEnvOtlpPushToken);
     if (p)
@@ -3191,6 +3372,11 @@ int main (int argc, char *argv[])
         }
     }
 
+    /* With -nostdin the output is only ours: the runtime names the process. In pipe mode the lines share the output with the
+       lines of the server, and the name tells them apart */
+    if (g_NoStdin)
+        SetLogPrefix (NULL);
+
     PrintBanner();
 
     /* --- No operations before this point because the parameter read loop exits for some parameters */
@@ -3200,6 +3386,8 @@ int main (int argc, char *argv[])
     if (getenv ("LOKI_PUSH_API_URL"))
         LogError ("LOKI_PUSH_API_URL is not supported anymore. Version 2.0 only pushes to OTLP. Please configure OTLP_PUSH_API_URL (see README)");
 
+    ValidatePushEncoding();
+    ValidateWalRetryConfig();
     ValidateBackupConfig();
 
     /* The backup is only used if it is configured, and it is checked above: an invalid one was removed */
@@ -3280,58 +3468,40 @@ int main (int argc, char *argv[])
 
     /* Create threads */
 
-    if (0 != pthread_create (&g_PushThreadInstance, NULL, PushThread, NULL))
-    {
-        perror ("pthread_create");
+    if (false == CreateThread (&g_PushThreadInstance, PushThread, NULL))
         return EXIT_FAILURE;
-    }
 
     if (*g_szOtlpPushApiURL)
     {
-        if (0 != pthread_create (&g_WalThreadInstance, NULL, WalThread, NULL))
-        {
-            perror ("pthread_create");
+        if (false == CreateThread (&g_WalThreadInstance, WalThread, NULL))
             return EXIT_FAILURE;
-        }
     }
 
-    if (0 != pthread_create (&g_MetricsThreadInstance, NULL, MetricsThread, NULL))
-    {
-        perror ("pthread_create");
+    if (false == CreateThread (&g_MetricsThreadInstance, MetricsThread, NULL))
         return EXIT_FAILURE;
-    }
 
     if (g_IngestUnix.bEnabled)
     {
         g_IngestUnix.Running = 1;
 
-        if (0 != pthread_create (&g_IngestUnix.Thread, NULL, IngestThread, &g_IngestUnix))
-        {
-            perror ("pthread_create");
+        if (false == CreateThread (&g_IngestUnix.Thread, IngestThread, &g_IngestUnix))
             return EXIT_FAILURE;
-        }
     }
 
     if (g_IngestTcp.bEnabled)
     {
         g_IngestTcp.Running = 1;
 
-        if (0 != pthread_create (&g_IngestTcp.Thread, NULL, IngestThread, &g_IngestTcp))
-        {
-            perror ("pthread_create");
+        if (false == CreateThread (&g_IngestTcp.Thread, IngestThread, &g_IngestTcp))
             return EXIT_FAILURE;
-        }
     }
 
     if (g_IngestSyslog.bEnabled)
     {
         g_IngestSyslog.Running = 1;
 
-        if (0 != pthread_create (&g_IngestSyslog.Thread, NULL, SyslogThread, &g_IngestSyslog))
-        {
-            perror ("pthread_create");
+        if (false == CreateThread (&g_IngestSyslog.Thread, SyslogThread, &g_IngestSyslog))
             return EXIT_FAILURE;
-        }
     }
 
     if (g_Mirror2Stdout && (0 == g_NoStdin))
@@ -3430,16 +3600,20 @@ int main (int argc, char *argv[])
         if (0 == (CountSeconds %10))
         {
             if (g_LogLevel)
-                fprintf (stderr, "Waiting %lu seconds for threads to terminate (Push: %lu, Wal: %lu, Metrics: %lu)\n", CountSeconds,
-                         static_cast<unsigned long>(g_PushThreadRunning.load()), static_cast<unsigned long>(g_WalThreadRunning.load()), static_cast<unsigned long>(g_MetricsThreadRunning.load()));
+            {
+                snprintf (szThreadMessage, sizeof (szThreadMessage), "Waiting %lu seconds for threads to terminate (Push: %lu, Wal: %lu, Metrics: %lu)", CountSeconds,
+                          static_cast<unsigned long>(g_PushThreadRunning.load()), static_cast<unsigned long>(g_WalThreadRunning.load()), static_cast<unsigned long>(g_MetricsThreadRunning.load()));
+                LogMessage (szThreadMessage);
+            }
         }
 
         sleep (1);
 
         if (CountSeconds > 300)
         {
-            fprintf (stderr, "Failed to terminate all threads (Push: %lu, Wal: %lu, Metrics: %lu)\n",
-                     static_cast<unsigned long>(g_PushThreadRunning.load()), static_cast<unsigned long>(g_WalThreadRunning.load()), static_cast<unsigned long>(g_MetricsThreadRunning.load()));
+            snprintf (szThreadMessage, sizeof (szThreadMessage), "Failed to terminate all threads (Push: %lu, Wal: %lu, Metrics: %lu)",
+                      static_cast<unsigned long>(g_PushThreadRunning.load()), static_cast<unsigned long>(g_WalThreadRunning.load()), static_cast<unsigned long>(g_MetricsThreadRunning.load()));
+            LogError (szThreadMessage);
             break;
         }
     }
