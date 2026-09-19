@@ -1,2 +1,22 @@
 *.o
-domfwd
+/otelfwd
+/otel-sink
+/loadtest
+/wal_test
+otel-received/
+otel-data/
+
+# domfwd build output
+/domfwd/domfwd
+/domfwd/*.obj
+/domfwd/*.exe
+/domfwd/*.pdb
+/domfwd/*.sym
+/domfwd/*.lib
+/domfwd/*.exp
+/domfwd/*.ilk
+/domfwd/*.map
+/domfwd/*.res
+
+# NGINX test container: data directory of the otelfwd started by nginx/run.sh (WAL, metrics)
+/nginx/otelfwd-data/

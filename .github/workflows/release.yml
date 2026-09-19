@@ -33,17 +33,17 @@ jobs:
               SPECIAL_LINK_OPTIONS=-static make"
 
           VERSION=$(cat version.txt)
-          DOMFWD_BIN="domfwd-$VERSION"
+          OTELFWD_BIN="otelfwd-$VERSION"
 
-          cp domfwd "$DOMFWD_BIN"
+          cp otelfwd "$OTELFWD_BIN"
 
-          sha256sum "$DOMFWD_BIN" | cut -f1 -d" " > checksum.txt
+          sha256sum "$OTELFWD_BIN" | cut -f1 -d" " > checksum.txt
 
       - name: Upload Release Assets
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            domfwd-*
+            otelfwd-*
             checksum.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

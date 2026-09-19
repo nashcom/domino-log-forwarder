@@ -1,0 +1,70 @@
+# NGINX configuration of the OTLP test container.
+# entrypoint.sh replaces the @...@ placeholders and writes the result to a temporary directory.
+#
+#   4318  HTTP      OTLP/HTTP endpoint, every request is forwarded to otel-sink
+#   4319  HTTPS     the same with a self-signed certificate
+#   4320  HTTP      always answers with an error, to test retries and the WAL
+#
+# NGINX runs as the user of the container (no "user" directive), so all paths have to be writable for that user.
+
+worker_processes 1;
+pid @TMP@/nginx.pid;
+error_log stderr warn;
+
+events
+{
+    worker_connections 256;
+}
+
+http
+{
+    default_type application/json;
+    server_tokens off;
+
+    # The access log is a file: opening /dev/stdout is not allowed for a non-root user in a container.
+    log_format sink '$time_iso8601 $remote_addr "$request" $status req=$request_length';
+    access_log @DATA@/nginx-access.log sink;
+
+    client_body_temp_path @TMP@/body;
+    proxy_temp_path       @TMP@/proxy;
+    fastcgi_temp_path     @TMP@/fastcgi;
+    uwsgi_temp_path       @TMP@/uwsgi;
+    scgi_temp_path        @TMP@/scgi;
+
+    client_max_body_size    32m;
+    client_body_buffer_size 1m;
+
+    server
+    {
+        listen 4318;
+
+        include @TMP@/locations.conf;
+    }
+
+    server
+    {
+        listen 4319 ssl;
+
+        ssl_certificate     @CERT@;
+        ssl_certificate_key @KEY@;
+        ssl_protocols       TLSv1.2 TLSv1.3;
+
+        include @TMP@/locations.conf;
+    }
+
+    server
+    {
+        listen 4320;
+
+        location = /healthz
+        {
+            default_type text/plain;
+            return 200 "ok\n";
+        }
+
+        location /
+        {
+            return @FAIL_STATUS@ '{"error":"simulated failure"}';
+        }
+    }
+}

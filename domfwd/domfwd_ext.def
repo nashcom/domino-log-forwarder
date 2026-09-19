@@ -1,0 +1,5 @@
+LIBRARY nnotes.dll
+EXPORTS
+    EventExtractAddinExt
+    EventExtractTargetData
+    EventQueueGetExt

@@ -1,0 +1,33 @@
+# OTLP test container. Builds the image from the Dockerfile when it does not exist yet.
+#
+#   BUILDKIT_PROGRESS=plain OTEL_SINK_UID=$(id -u) OTEL_SINK_GID=$(id -g) docker compose up          build if needed, start
+#   BUILDKIT_PROGRESS=plain OTEL_SINK_UID=$(id -u) OTEL_SINK_GID=$(id -g) docker compose up --build  build again first (after changing the sources)
+#
+# BUILDKIT_PROGRESS=plain prints the build log as plain text (readable in a terminal log or in CI). It can be left out.
+#
+# The settings can also be put into a file named .env next to this file.
+# OTEL_SINK_UID / OTEL_SINK_GID make the files in ./otel-data belong to you (default: 1000).
+
+#   docker exec -it otel-test-sink bash                                      a shell in the running container
+
+services:
+  otel-test-sink:
+    image: otel-test-sink
+    container_name: otel-test-sink
+    hostname: otel-test-sink
+    build:
+      context: .
+    user: "${OTEL_SINK_UID:-1000}:${OTEL_SINK_GID:-1000}"
+    ports:
+      - "127.0.0.1:4318:4318"     # OTLP/HTTP
+      - "127.0.0.1:4319:4319"     # OTLP/HTTPS, self-signed certificate
+      - "127.0.0.1:4320:4320"     # always fails, for retry and WAL tests
+    environment:
+      OTEL_SINK_TOKEN: "${OTEL_SINK_TOKEN:-}"
+      OTEL_SINK_FAIL_STATUS: "${OTEL_SINK_FAIL_STATUS:-503}"
+      # the container name is part of the certificate, so other containers on the same network can use https://otel-test-sink:4319
+      OTEL_SINK_SAN: "${OTEL_SINK_SAN:-DNS:localhost,DNS:otel-test-sink,IP:127.0.0.1}"
+      OTEL_SINK_RAW: "${OTEL_SINK_RAW:-0}"
+    volumes:
+      - ./otel-data:/data
+    restart: "no"

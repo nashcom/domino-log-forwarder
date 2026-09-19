@@ -1,0 +1,7 @@
+# Keep Unix line endings for the makefile, and Windows line endings for the Windows build files
+makefile text eol=lf
+*.cpp text
+*.hpp text
+mk.cmd text eol=crlf
+mswin64.mak text eol=crlf
+*.def text eol=crlf

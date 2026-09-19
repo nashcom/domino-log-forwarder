@@ -1,0 +1,11 @@
+Domino server startup (a line without process prefix)
+[86243:000002-00007D9DC1973740] 09/18/2026 21:15:01   Replicator: Starting replication with server pluto/NotesLab
+[86243:000002-00007D9DC1973740] 09/18/2026 21:15:02   Finished replication with server pluto/NotesLab
+[86261:000003-00007E61FEDAE2C0] 09/18/2026 21:15:03   HTTP Server: Started
+[86261:000004-00007E61FEDAE2C0] 09/18/2026 21:15:03   HTTP Server: Using Web Configuration View
+[86270:000002-00007F1234567890] 09/18/2026 21:15:04   Router: Mail Router started for domain NotesLab
+[86270:000005-00007F1234567890] 09/18/2026 21:15:09   Router: 3 messages delivered to local mailboxes
+[86261:000006-00007E61FEDAE2C0] 09/18/2026 21:15:12   Warning: HTTP Web Server: Command Not Handled Exception [/favicon.ico]
+[86243:000007-00007D9DC1973740] 09/18/2026 21:15:20   Error: Database 'names.nsf' could not be opened: File does not exist
+[86270:000008-00007F1234567890] 09/18/2026 21:15:31   Router: Message 00A1B2C3 delivered to Jörg Müller/NotesLab (Umlaute und Sonderzeichen: äöüß €)
+[86261:000009-00007E61FEDAE2C0] 09/18/2026 21:15:40   HTTP Server: Shutdown

@@ -3,15 +3,15 @@ CXXFLAGS = -O2 -Wall -pedantic -flto
 LDFLAGS  = -static -flto
 LDLIBS   = $(shell pkg-config --static --libs libcurl)
 
-TARGET = domfwd
-OBJS   = domfwd.o simple_wal.o
+TARGET = otelfwd
+OBJS   = otelfwd.o simple_wal.o
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
-domfwd.o: domfwd.cpp
+otelfwd.o: otelfwd.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 simple_wal.o: simple_wal.cpp simple_wal.hpp

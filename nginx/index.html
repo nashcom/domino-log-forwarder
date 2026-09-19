@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>otelfwd test NGINX</title></head>
+<body>
+<h1>otelfwd test NGINX</h1>
+<p>Every request to this server is logged to <code>otelfwd</code> through its syslog socket.</p>
+<ul>
+  <li><a href="/">/</a> this page (200)</li>
+  <li><a href="/missing.html">/missing.html</a> file not found: 404 and an error log entry</li>
+  <li><a href="/status/301">/status/301</a>, <a href="/status/404">/status/404</a>, <a href="/status/500">/status/500</a>, <a href="/status/503">/status/503</a> fixed status codes</li>
+  <li><a href="/?token=secret">/?token=secret</a> query string: it must not show up in the log</li>
+</ul>
+</body>
+</html>

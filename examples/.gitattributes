@@ -1,0 +1,5 @@
+# The scripts have to keep Unix line endings, also in a Windows checkout (they run in WSL or Linux)
+*.sh text eol=lf
+*.jsonl text eol=lf
+*.log text eol=lf
+pid.nbf text eol=lf

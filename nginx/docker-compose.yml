@@ -1,0 +1,49 @@
+# NGINX test container for the syslog input of otelfwd. A plain HTTP server on host port 18080 (OTELFWD_NGINX_PORT) which logs to otelfwd through its socket.
+#
+# Easiest: bash run.sh. It creates the socket directory, starts otelfwd and then this container (docker compose up --build).
+#
+# By hand:
+#
+# 1. Create the directory of the socket as your user, on a Linux file system (not on /mnt/c or /mnt/d: sockets cannot be
+#    created there). If Docker creates it for the mount, it belongs to root and otelfwd cannot create its socket in it.
+#
+#      mkdir -p /tmp/otelfwd-syslog
+#
+# 2. Start otelfwd, as the same user, with the syslog socket in that directory:
+#
+#      OTELFWD_SYSLOG_SOCKET=/tmp/otelfwd-syslog/syslog.sock OTLP_PUSH_API_URL=http://127.0.0.1:4318/v1/logs otelfwd -nostdin
+#
+# 3. Start the container. It runs with your user id, so the default mode 0600 of the socket is enough.
+#    Do not run it as root: NGINX started as root runs its workers as the "nginx" user, which cannot open your socket.
+#
+#      BUILDKIT_PROGRESS=plain OTELFWD_UID=$(id -u) OTELFWD_GID=$(id -g) docker compose up --build
+#
+# 4. Send requests:
+#
+#      curl -s http://127.0.0.1:18080/ ; curl -s http://127.0.0.1:18080/missing.html ; curl -s http://127.0.0.1:18080/status/500
+#
+# The settings can also be put into a file named .env next to this file.
+#
+# The socket DIRECTORY is mounted, at /run/otelfwd in the container, and not the socket file: otelfwd creates the file again
+# every time it starts, and NGINX finds the new file on its own. The normal NGINX logs stay inside the container.
+#
+#   docker exec -it otelfwd-test-nginx bash                                   a shell in the running container
+#   docker exec otelfwd-test-nginx tail -f /var/log/nginx/access_test.log     the plain file log, to compare with what arrives
+
+services:
+  otelfwd-test-nginx:
+    image: otelfwd-test-nginx
+    container_name: otelfwd-test-nginx
+    build:
+      context: .
+    init: true
+    user: "${OTELFWD_UID:-1000}:${OTELFWD_GID:-1000}"
+    # The network of the host: no NAT and no Docker proxy between the load test and NGINX, which would slow a load test down.
+    # There is no "ports" and no "hostname" (the container has the host name of the host). NGINX listens on 127.0.0.1 only.
+    network_mode: host
+    environment:
+      OTELFWD_NGINX_PORT: "${OTELFWD_NGINX_PORT:-18080}"    # the port of NGINX on 127.0.0.1 of the host
+    volumes:
+      # the directory of the syslog socket of otelfwd. /run/otelfwd/syslog.sock is the path in otelfwd-logging.conf.
+      - "${OTELFWD_SOCKET_DIR:-/tmp/otelfwd-syslog}:/run/otelfwd"
+    restart: "no"

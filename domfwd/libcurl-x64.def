@@ -1,0 +1,13 @@
+LIBRARY nnotes.dll
+
+EXPORTS
+    curl_easy_cleanup
+    curl_easy_init
+    curl_easy_perform
+    curl_easy_setopt
+    curl_easy_strerror
+    curl_global_cleanup
+    curl_global_init
+    curl_slist_append
+    curl_slist_free_all
+    curl_version

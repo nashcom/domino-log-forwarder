@@ -1,0 +1,64 @@
+# nginx.conf.template of the otelfwd test container. A plain HTTP server on 127.0.0.1, no TLS. The container uses the network of the
+# host, so the port is the real port on the host. entrypoint.sh replaces @PORT@ with OTELFWD_NGINX_PORT (default 18080).
+# The access and error log go to otelfwd through the syslog socket /run/otelfwd/syslog.sock,
+# configured in otelfwd-logging.conf (the same file as for a real NGINX).
+
+worker_processes 1;
+pid /tmp/nginx.pid;
+
+# Startup and configuration errors. "stderr" is a keyword: it writes to the standard error, no file has to be opened
+error_log stderr warn;
+
+events {
+    worker_connections 4096;
+}
+
+http {
+    include      /etc/nginx/mime.types;
+    default_type text/plain;
+
+    # The load test (loadtest) keeps its connections open. NGINX closes a connection after 1000 requests by default
+    keepalive_requests 1000000;
+
+    # The container runs as a non-root user with any user id: temporary files go directly to /tmp, which every user can write.
+    # NGINX creates only the last part of these paths, so a directory below /tmp would have to exist and be writable
+    client_body_temp_path /tmp/nginx_client_temp;
+    proxy_temp_path       /tmp/nginx_proxy_temp;
+    fastcgi_temp_path     /tmp/nginx_fastcgi_temp;
+    uwsgi_temp_path       /tmp/nginx_uwsgi_temp;
+    scgi_temp_path        /tmp/nginx_scgi_temp;
+
+    # log_format otelfwd_json, access_log and error_log to the syslog socket, and two plain files to compare with:
+    #   /var/log/nginx/access_test.log and /var/log/nginx/error_test.log
+    include /etc/nginx/otelfwd-logging.conf;
+
+    server {
+        listen      127.0.0.1:@PORT@;
+        server_name _;
+        root        /www;
+
+        # The health check of the container. Not logged
+        location = /health {
+            access_log off;
+            return 200 "ok\n";
+        }
+
+        # Answers with a fixed status, to see different status codes in the access log
+        location = /status/301 { return 301 /; }
+        location = /status/404 { return 404 "not found\n"; }
+        location = /status/500 { return 500 "server error\n"; }
+        location = /status/503 { return 503 "unavailable\n"; }
+
+        # The requests of the load test: /otelfwd-test/<thread>/<count>/<sent_ns>. Answered with 404 without looking for a file, so
+        # there is no [error] line in the error log for every request. They are logged to otelfwd only. The two plain files of
+        # otelfwd-logging.conf are left out: millions of lines would fill the file system of the container.
+        # The access_log line is the one of otelfwd-logging.conf, without the plain file.
+        location /otelfwd-test/ {
+            access_log syslog:server=unix:/run/otelfwd/syslog.sock,tag=nginx_access,severity=info,nohostname otelfwd_json;
+            return 404 "test\n";
+        }
+
+        # A file which does not exist: 404 in the access log and an [error] entry in the error log
+        # Everything else is served from /www
+    }
+}
