@@ -23,8 +23,9 @@ otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR)
 	$(CXX) $(CXXFLAGS) -o $@ otelfwd.cpp $(WAL_SRC) $(LDFLAGS)
 
 # Unit test of the WAL module alone: no otelfwd, no network. Also measures the throughput of the WAL
+# --wrap lets the test make ftruncate and unlink fail on request (fault injection), without any test code in the WAL
 wal_unit_test: wal_unit_test.cpp $(WAL_SRC) $(WAL_HDR)
-	$(CXX) $(CXXFLAGS) -pthread -o $@ wal_unit_test.cpp $(WAL_SRC)
+	$(CXX) $(CXXFLAGS) -pthread -Wl,--wrap=ftruncate -Wl,--wrap=unlink -o $@ wal_unit_test.cpp $(WAL_SRC)
 
 # Test tool: receiving end of the OTLP test container, see tools/otel-sink/. Not part of "all".
 #   make otel-sink                needs rapidjson and zlib headers

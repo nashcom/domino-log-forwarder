@@ -415,6 +415,110 @@ Both scripts print how many lines were pushed and return an error if the push fa
 
 ## Testing
 
+| Test                     | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                             |
+| :----------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| WAL unit test            | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, speed                                                                                                             |
+| Load test                | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                  |
+| Load test with an outage | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                    | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end)) |
+
+### Unit test of the WAL
+
+`wal_unit_test.cpp` is a separate program which only links the WAL (`simple_wal.cpp`). It needs no `otelfwd`, no libcurl, no Docker and no network. It works in a directory of its own, which it removes at the end, and takes a few seconds.
+
+```bash
+make test
+```
+
+`make` compiles the test when a source changed, and runs it. If a check fails, `make` ends with an error. The test can also be started directly:
+
+```bash
+./wal_unit_test
+```
+
+| Option      | Description                                                                                                                                                                                     |
+| :---------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `-n COUNT`  | Number of records of the producer and consumer test and of the performance table. Default: 100000                                                                                               |
+| `DIRECTORY` | The parent directory of the test files. Default: `/tmp`, which can be a RAM file system. The test makes a directory of its own in it and removes it. See [Performance](#performance-of-the-wal) |
+
+```bash
+./wal_unit_test -n 1000000
+```
+
+**Files of the WAL:** `otelfwd.wal` holds the push requests which could not be delivered. `otelfwd.wal.commit` holds the position of the first record which is not replayed yet. `otelfwd.wal.corrupt` receives data which cannot be read (a record cut off by a crash, or a damaged length). Records are delivered at least once: after a crash a record can be delivered again, but none is lost.
+
+#### Reading the output
+
+The output has headed sections. Every check is one line with its status:
+
+```text
+--------------------------------------------------------------------------------
+Behaviour
+--------------------------------------------------------------------------------
+
+[PASS]  round trip: init
+[PASS]  round trip: a new WAL has nothing pending
+...
+--------------------------------------------------------------------------------
+Result
+--------------------------------------------------------------------------------
+
+[PASS]  144 of 144 checks passed, 0 failed
+```
+
+* `[PASS]` and `[FAIL]` mark every check. If something failed, a section **Failed checks** lists only those lines, before the section **Result**.
+* The last section, **Result**, is `[PASS]` only if every check passed. The exit code of the program is 0 then, and 1 otherwise.
+* The WAL writes warnings and errors to stderr, and some tests cause them on purpose, for example `WAL: Error - unreadable data at offset ... moved to ....corrupt` or `Cannot write to WAL: File too large`. They are not failures. Only a `[FAIL]` line is.
+
+#### What it tests
+
+| Section                | Names of the checks start with | What it covers                                                                                                                                                                                                                                                                                                                                                                      |
+| :--------------------- | :----------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Behaviour              | the name of the test           | Order of the records, partial replay and resuming it, no progress, empty records and a WAL which was not opened, restart, the destructor, `Clear()`, a 5 MB record, 10,000 records, four threads appending at once, one thread appending while another replays                                                                                                                      |
+| Findings of the review | `[finding N]`                  | Problems which a code review found. A replay must not get stuck at a commit position at or behind the end of the WAL, a record which was cut off by a crash, a damaged length or a partial header. A failed append leaves nothing behind. Files are only accessible for their owner, also old ones. A new WAL is silent. A commit file which is short, empty or too long is ignored |
+| Second review          | `[review 2]`                   | A commit position inside a record is not used: the WAL is replayed from the start. Failures while saving: the commit position cannot be written, the WAL cannot be truncated, the commit file cannot be removed, the unreadable part cannot be moved. A zero length is damage, not the end. The repaired state survives a restart. The sync option. Real crashes                    |
+| Performance            | `performance:`                 | Speed of appending, replaying and starting with a backlog, with a table and very low limits ([below](#performance-of-the-wal))                                                                                                                                                                                                                                                      |
+
+The tests for failures use these techniques. None of them needs code for tests in the WAL:
+
+* **A full disk** is simulated with the size limit of a file (`setrlimit`), which also works as root.
+* **A directory with the name of the file** makes it impossible to create the `.corrupt` file.
+* **Fault injection:** the makefile links the test with `-Wl,--wrap=ftruncate -Wl,--wrap=unlink`. The test then makes these two functions fail on request, and the calls of the WAL go through them. If the test is compiled by hand without these options, the checks for a failing `ftruncate` or `unlink` fail, because the failure is never injected.
+* **Crashes are real:** a child process (`fork`) ends with `_exit()`, which runs no destructor. In one test it ends after appending, and the parent must find the records. In another it ends inside the replay, after a record was delivered and before the position was saved. The parent must get all records again.
+
+#### Performance of the WAL
+
+The last section prints a table:
+
+```text
+File system: tmpfs (memory, not a disk: fsync does nothing, speeds are much higher than on a disk)
+
+Measurement                                            Records  Time (ms)    Records/s      MB/s
+append, 100 byte records, one thread                    100000       61.5      1625380     169.0
+replay everything, 100 byte records                     100000       43.5      2301332     239.3
+append, 64 KB records (a push request)                    1000       13.1        76113    4988.5
+replay everything, 64 KB records                          1000       14.3        69830    4576.6
+start with a backlog: check of the commit position       50000       10.2      4888202     508.4
+append with fsync, 100 byte records (no limit)            2000        1.3      1518900     158.0
+```
+
+* **The file system decides.** The line above the table names it. On a RAM file system (`tmpfs`) `fsync` does nothing and everything is much faster than on a disk. `/tmp` can be one. To measure the disk where the WAL of `otelfwd` lives, give its directory. The test makes its own subdirectory in it and removes it:
+
+```bash
+./wal_unit_test /local/notesdata
+```
+
+* **The numbers depend on the machine and its load.** They are for comparing two versions of the WAL on the same machine and the same file system, not absolute values. Run it a few times, and not while another test runs.
+* **Start with a backlog** is the check which `Replay` does once when a program starts: it follows the records up to the commit position to make sure that it is the start of a record. The time grows with the number of records before the position.
+* **The checks have very low limits** on purpose (20,000 records/s for small records, 200 records/s for 64 KB records, 50,000 records/s for the check at start). They only fail when something is dramatically wrong. The `fsync` row has no limit, because it depends on the disk.
+
+#### Adding a test
+
+Write a function in `wal_unit_test.cpp` and call it from `main` in the fitting section. Use `Check (condition, "name")`, one call for every statement which must be true. The name is what appears in the output, so it should say what is expected. Look at the files on disk (`FileSize`, `FileExists`, `FileMode`) and do not trust the WAL to report about itself. For a bug, write the test first and see it fail, then fix the WAL and see it pass.
+
+The former program `wal_test` (a speed test without checks) is part of this test now: the producer and consumer test checks that every record arrives once and in order, and the performance section prints the speed.
+
+### Test receiver and load test
+
 `tools/otel-sink` is a test container with an OTLP/HTTP receiver: NGINX in front (HTTP, HTTPS with a generated certificate, a bearer token check, a port which always fails) and a small program which writes every POST to its own JSON file.
 It is built from Alpine with Docker Compose. See [tools/otel-sink/README.md](tools/otel-sink/README.md).
 
@@ -427,6 +531,18 @@ The whole path can be load tested: `nginx/run_loadtest.sh` starts the sink, `ote
 ```bash
 ./nginx/run_loadtest.sh
 ```
+
+### Load test with an outage: the WAL end to end
+
+`--fail-for SEC` makes the test sink answer `503` for that long, and then recover. Every push fails at first, so the events go to the WAL, and `otelfwd` replays them afterwards. Every event must still arrive exactly once. The test has to wait for the replay, so it needs long limits:
+
+```bash
+./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200
+```
+
+* **`--wait` and `--stall` are both needed.** `otelfwd` waits about two minutes before it retries the WAL, and nothing arrives in that time. The test also stops when nothing new arrived for `--stall` seconds (default 15). With the default it gives up after 15 seconds and reports every event as missing, although they are still in the WAL.
+* **What to expect:** `RESULT: PASS`. The events arrive about two minutes after they were sent. In the block about `otelfwd`, `lines pushed ok / failed` shows all lines as failed, because the first push of every one failed, and `WAL requests replayed ok` is above 0. Duplicates are allowed (at least once).
+* The run takes a few minutes.
 
 ## Metrics
 
