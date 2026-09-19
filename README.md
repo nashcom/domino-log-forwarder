@@ -35,7 +35,7 @@ NGINX (syslog) ──────────── UNIX datagram ───┤
                                              ├── resource/scope grouping
                                              └── OTLP/HTTP JSON
                                                      │  HTTP(S) over TCP, outbound
-                                                     │  URL from OTLP_PUSH_API_URL, OTLP default port 4318
+                                                     │  configurable URL, OTLP default port 4318
                                                      ▼
                                            any OTLP receiver
                                         (tested with Grafana Loki)
