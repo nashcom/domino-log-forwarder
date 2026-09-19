@@ -4,21 +4,27 @@ LDFLAGS  = -lcurl
 
 # Targets
 TARGET  = otelfwd
-TARGET_TEST = wal_test
+TARGET_TEST = wal_unit_test
 
 # Common sources
 WAL_SRC  = simple_wal.cpp
 WAL_HDR  = simple_wal.hpp
 
+# Targets which are not files. Without this a file named "test" would make "make test" do nothing
+.PHONY: all test clean
+
 all: $(TARGET)
 
+# Builds and runs the unit test of the WAL
 test: $(TARGET_TEST)
+	./$(TARGET_TEST)
 
 otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR)
 	$(CXX) $(CXXFLAGS) -o $@ otelfwd.cpp $(WAL_SRC) $(LDFLAGS)
 
-wal_test: wal_test.cpp $(WAL_SRC) $(WAL_HDR)
-	$(CXX) $(CXXFLAGS) -o $@ wal_test.cpp $(WAL_SRC) $(LDFLAGS)
+# Unit test of the WAL module alone: no otelfwd, no network. Also measures the throughput of the WAL
+wal_unit_test: wal_unit_test.cpp $(WAL_SRC) $(WAL_HDR)
+	$(CXX) $(CXXFLAGS) -pthread -o $@ wal_unit_test.cpp $(WAL_SRC)
 
 # Test tool: receiving end of the OTLP test container, see tools/otel-sink/. Not part of "all".
 #   make otel-sink                needs rapidjson and zlib headers

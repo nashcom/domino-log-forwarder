@@ -2,7 +2,7 @@
 /otelfwd
 /otel-sink
 /loadtest
-/wal_test
+/wal_unit_test
 otel-received/
 otel-data/
 
