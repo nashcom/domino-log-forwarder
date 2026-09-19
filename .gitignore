@@ -3,6 +3,7 @@
 /otel-sink
 /loadtest
 /wal_unit_test
+/push_failover_test
 otel-received/
 otel-data/
 

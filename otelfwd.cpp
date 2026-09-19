@@ -29,6 +29,21 @@
 
 #define OTELFWD_DEFAULT_SHUTDOWN_MAX_WAIT_SEC 30
 
+/* How often the primary OTLP endpoint is tried again while the backup endpoint is in use */
+#define OTELFWD_DEFAULT_FAILBACK_SEC          60
+#define OTELFWD_MAX_FAILBACK_SEC              86400
+
+/* A receiver which does not accept the connection in this time is treated as not reachable */
+#define OTELFWD_PUSH_CONNECT_TIMEOUT_SEC      3
+
+/* Time for a whole push request. The try of the primary while the backup is in use (a probe) gets less: a primary which does
+   not answer must not hold up the request for the whole time */
+#define OTELFWD_PUSH_TIMEOUT_SEC              15
+#define OTELFWD_PUSH_PROBE_TIMEOUT_SEC        5
+
+/* How much of the answer of the receiver is kept for the log */
+#define OTELFWD_PUSH_RESPONSE_MAX             512
+
 #define OTELFWD_VERSION_BUILD (OTELFWD_VERSION_MAJOR * 10000 +  OTELFWD_VERSION_MINOR * 100 + OTELFWD_VERSION_PATCH)
 
 
@@ -56,6 +71,7 @@
 
 
 #include <stdint.h>
+#include <strings.h>
 #include <arpa/inet.h>
 #include <curl/curl.h>
 #include <netinet/in.h>
@@ -79,6 +95,8 @@
 #include <rapidjson/writer.h>
 
 #include "simple_wal.hpp"
+#include "push_status.hpp"
+#include "push_failover.hpp"
 
 /* pid.nbf map definition */
 using PidMap = std::unordered_map<pid_t, std::string>;
@@ -261,6 +279,8 @@ char g_szEnvSyslogSocketMode[]       = "OTELFWD_SYSLOG_SOCKET_MODE";
 char g_szEnvTcpListen[]              = "OTELFWD_TCP_LISTEN";
 char g_szEnvSocketQueueMax[]         = "OTELFWD_SOCKET_QUEUE_MAX";
 char g_szEnvOtlpPushApiUrl[]         = "OTLP_PUSH_API_URL";
+char g_szEnvOtlpPushApiUrlBackup[]   = "OTLP_PUSH_API_URL_BACKUP";
+char g_szEnvOtlpPushFailbackSec[]    = "OTLP_PUSH_FAILBACK_SEC";
 char g_szEnvOtlpPushToken[]          = "OTLP_PUSH_TOKEN";
 char g_szEnvOtlpCaFile[]             = "OTLP_CA_FILE";
 char g_szEnvOtlpServiceName[]        = "OTLP_SERVICE_NAME";
@@ -272,6 +292,8 @@ char g_szEnvOtlpServiceInstanceId[]  = "OTLP_SERVICE_INSTANCE_ID";
 char g_szHostname[1024]          = {0};
 char g_szPidNbfFile[2048]        = {0};
 char g_szOtlpPushApiURL[1024]    = {0};
+char g_szOtlpPushApiURLBackup[1024] = {0};   /* optional second endpoint, used when the primary fails */
+size_t g_FailbackSec             = OTELFWD_DEFAULT_FAILBACK_SEC;
 char g_szOtlpPushToken[1024]     = {0};
 char g_szOtlpCaFile[1024]        = {0};
 char g_szWalFile[2048]           = {0};
@@ -339,6 +361,11 @@ log_fifo g_LogFifo;
 
 /* WAL implementation. Only used when OTLP push is configured */
 SimpleWAL g_Wal;
+bool g_bWalOpened = false;      /* the result of opening it. Only used for the summary at start */
+
+/* Which OTLP endpoint gets a push request: the primary, or the backup while the primary fails. Used by the push thread
+   and by the thread which replays the WAL */
+PushFailover g_PushFailover;
 
 /* Socket inputs */
 IngestSource g_IngestUnix ("unix");
@@ -351,6 +378,7 @@ std::atomic<std::int64_t> g_Metric_PushSuccess      {0};
 std::atomic<std::int64_t> g_Metric_PushErrors       {0};
 std::atomic<std::int64_t> g_Metric_PushRetrySuccess {0};
 std::atomic<std::int64_t> g_Metric_PushRetryErrors  {0};
+std::atomic<std::int64_t> g_Metric_PushRejected     {0};   /* push requests which the receiver refused as bad data (HTTP 400): dropped */
 
 /* Helper functions */
 
@@ -1205,16 +1233,68 @@ bool SendPayloadToWAL (const std::string& payload)
 }
 
 
-/* Posts a JSON payload to the OTLP/HTTP logs endpoint */
-bool SendPushPayload (CURL* pCurl, const char *pszURL, const char *pszPushToken, const char *pszCaFile, const char* pszBuffer, size_t BufferLen)
+/* Collects the start of the answer of the receiver, for the log. Without a callback libcurl writes the answer to stdout */
+static size_t PushWriteCallback (char *pData, size_t Size, size_t Items, void *pUserData)
 {
-    bool bSuccess = false;
+    std::string *pResponse = static_cast<std::string *> (pUserData);
+    size_t Len = Size * Items;
+    size_t Max = OTELFWD_PUSH_RESPONSE_MAX;
+
+    if ( pResponse && (pResponse->size() < Max) )
+        pResponse->append (pData, std::min (Len, Max - pResponse->size()));
+
+    return Len;
+}
+
+
+/* Logs why a push request was not accepted: the status and the start of the answer. The answer can carry control characters */
+static void LogPushStatus (PushAction Action, long HttpCode, const std::string& Response)
+{
+    static std::atomic<time_t> tLastRejected {0};
+    std::string Text = "HTTP status " + std::to_string (HttpCode);
+    std::string Answer = Response;
+
+    for (char& c : Answer)
+    {
+        if ( (static_cast<unsigned char>(c) < 0x20) || (0x7f == static_cast<unsigned char>(c)) )
+            c = ' ';
+    }
+
+    while ( (false == Answer.empty()) && (' ' == Answer.back()) )
+        Answer.pop_back();
+
+    if (false == Answer.empty())
+        Text += ": " + Answer;
+
+    if (PUSH_REJECTED == Action)
+    {
+        /* A receiver which refuses everything would make a message for every request: at most one every 10 seconds */
+        time_t tNow  = time (NULL);
+        time_t tLast = tLastRejected.load();
+
+        if ( (tNow - tLast < 10) || (false == tLastRejected.compare_exchange_strong (tLast, tNow)) )
+            return;
+
+        LogError ("The receiver refused the push request as bad data. The data is dropped", Text.c_str());
+        return;
+    }
+
+    LogError ("Push request was not accepted", Text.c_str());
+}
+
+
+/* Posts a JSON payload to the OTLP/HTTP logs endpoint. What the answer means is decided by GetPushAction (push_status.hpp) */
+PushAction SendPushPayload (CURL* pCurl, const char *pszURL, const char *pszPushToken, const char *pszCaFile, const char* pszBuffer, size_t BufferLen, long TimeoutSec)
+{
+    PushAction Action = PUSH_RETRY;
     char szErrorBuffer[CURL_ERROR_SIZE+10] = {0};
     CURLcode rc = CURLE_OK;
+    long HttpCode = 0;
+    std::string Response;
     struct curl_slist* pHeaders = nullptr;
 
     if (IsNullStr (pszBuffer))
-        return false;
+        return PUSH_RETRY;
 
     if (nullptr == pCurl)
     {
@@ -1233,8 +1313,14 @@ bool SendPushPayload (CURL* pCurl, const char *pszURL, const char *pszPushToken,
     pHeaders = curl_slist_append (pHeaders, "Content-Type: application/json");
     curl_easy_setopt (pCurl, CURLOPT_HTTPHEADER, pHeaders);
     curl_easy_setopt (pCurl, CURLOPT_POST, 1L);
-    curl_easy_setopt (pCurl, CURLOPT_TIMEOUT, 15L);
-    curl_easy_setopt (pCurl, CURLOPT_FAILONERROR, 1L);
+    curl_easy_setopt (pCurl, CURLOPT_TIMEOUT, TimeoutSec);
+
+    /* A receiver which does not answer must not block the push thread for the whole timeout */
+    curl_easy_setopt (pCurl, CURLOPT_CONNECTTIMEOUT, static_cast<long> (OTELFWD_PUSH_CONNECT_TIMEOUT_SEC));
+
+    /* No CURLOPT_FAILONERROR: it would throw away the answer of an error status, and the status is judged below */
+    curl_easy_setopt (pCurl, CURLOPT_WRITEFUNCTION, PushWriteCallback);
+    curl_easy_setopt (pCurl, CURLOPT_WRITEDATA, &Response);
 
     curl_easy_setopt (pCurl, CURLOPT_ERRORBUFFER, szErrorBuffer);
     curl_easy_setopt (pCurl, CURLOPT_URL, pszURL);
@@ -1254,13 +1340,19 @@ bool SendPushPayload (CURL* pCurl, const char *pszURL, const char *pszPushToken,
 
     rc = curl_easy_perform (pCurl);
 
+    /* No answer at all (no connection, timeout ...): the request is tried again later */
     if (CURLE_OK != rc)
     {
         LogError ("Curl operation failed", szErrorBuffer);
         goto Done;
     }
 
-    bSuccess = true;
+    curl_easy_getinfo (pCurl, CURLINFO_RESPONSE_CODE, &HttpCode);
+
+    Action = GetPushAction (HttpCode);
+
+    if (PUSH_ACCEPTED != Action)
+        LogPushStatus (Action, HttpCode, Response);
 
 Done:
 
@@ -1270,7 +1362,39 @@ Done:
         pHeaders = nullptr;
     }
 
-    return bSuccess;
+    return Action;
+}
+
+
+/* Sends one push request to the endpoint which g_PushFailover chooses: the primary, or the backup while the primary fails.
+   The token and the CA file are the same for both. A change of the endpoint in use is logged: it is the one message an
+   admin needs to see that the traffic moved */
+PushAction SendPushRequest (CURL* pCurl, const char* pszBuffer, size_t BufferLen)
+{
+    int  SwitchedTo = -1;
+    char szMessage[2200] = {0};
+
+    PushAction Action = g_PushFailover.Send ([&] (PushEndpoint Endpoint, bool bProbe)
+    {
+        const char *pszURL = (PUSH_PRIMARY == Endpoint) ? g_szOtlpPushApiURL : g_szOtlpPushApiURLBackup;
+        long TimeoutSec    = bProbe ? OTELFWD_PUSH_PROBE_TIMEOUT_SEC : OTELFWD_PUSH_TIMEOUT_SEC;
+
+        return SendPushPayload (pCurl, pszURL, g_szOtlpPushToken, g_szOtlpCaFile, pszBuffer, BufferLen, TimeoutSec);
+    }, time (NULL), &SwitchedTo);
+
+    if (PUSH_BACKUP == SwitchedTo)
+    {
+        snprintf (szMessage, sizeof (szMessage), "The primary endpoint failed. Using the backup endpoint %s. The primary is tried again every %lu seconds",
+                  g_szOtlpPushApiURLBackup, static_cast<unsigned long> (g_FailbackSec));
+        LogMessage (szMessage);
+    }
+    else if (PUSH_PRIMARY == SwitchedTo)
+    {
+        snprintf (szMessage, sizeof (szMessage), "The primary endpoint %s accepts requests again. Using it again", g_szOtlpPushApiURL);
+        LogMessage (szMessage);
+    }
+
+    return Action;
 }
 
 
@@ -1337,14 +1461,21 @@ void *PushThread (void *arg)
                 std::string jOtlpPayload = BuildOtlpPayload (OtlpBatch);
                 std::int64_t BatchSize   = static_cast<std::int64_t>(OtlpBatch.size());
 
-                if (false == SendPushPayload (pCurl, g_szOtlpPushApiURL, g_szOtlpPushToken, g_szOtlpCaFile, jOtlpPayload.c_str(), jOtlpPayload.size()))
+                PushAction Action = SendPushRequest (pCurl, jOtlpPayload.c_str(), jOtlpPayload.size());
+
+                if (PUSH_ACCEPTED == Action)
                 {
-                    g_Metric_PushErrors.fetch_add (BatchSize, std::memory_order_relaxed);
-                    SendPayloadToWAL (jOtlpPayload);
+                    g_Metric_PushSuccess.fetch_add (BatchSize, std::memory_order_relaxed);
+                }
+                else if (PUSH_REJECTED == Action)
+                {
+                    /* The receiver refuses this data for good: not kept in the WAL. It is counted and logged */
+                    g_Metric_PushRejected.fetch_add (1, std::memory_order_relaxed);
                 }
                 else
                 {
-                    g_Metric_PushSuccess.fetch_add (BatchSize, std::memory_order_relaxed);
+                    g_Metric_PushErrors.fetch_add (BatchSize, std::memory_order_relaxed);
+                    SendPayloadToWAL (jOtlpPayload);
                 }
             }
 
@@ -1386,16 +1517,23 @@ bool PushWalEntries()
 
     bSuccess = g_Wal.Replay ([pCurl] (const std::vector<uint8_t>& Record)
     {
-        if (SendPushPayload (pCurl, g_szOtlpPushApiURL, g_szOtlpPushToken, g_szOtlpCaFile, (const char *) Record.data(), Record.size()))
+        PushAction Action = SendPushRequest (pCurl, (const char *) Record.data(), Record.size());
+
+        if (PUSH_ACCEPTED == Action)
         {
             g_Metric_PushRetrySuccess.fetch_add (1, std::memory_order_relaxed);
             return true;
         }
-        else
+
+        if (PUSH_REJECTED == Action)
         {
-            g_Metric_PushRetryErrors.fetch_add (1, std::memory_order_relaxed);
-            return false;
+            /* The receiver refuses this record for good. Drop it, or it would block every record behind it */
+            g_Metric_PushRejected.fetch_add (1, std::memory_order_relaxed);
+            return true;
         }
+
+        g_Metric_PushRetryErrors.fetch_add (1, std::memory_order_relaxed);
+        return false;
     });
 
     if (pCurl)
@@ -2362,6 +2500,25 @@ bool WriteMetrics (bool bShutdown = false)
     WriteStatsEntryToFile (fp, g_Metric_PushRetrySuccess.load (std::memory_order_relaxed), "push_retry_total{result=\"success\"}");
     WriteStatsEntryToFile (fp, g_Metric_PushRetryErrors.load (std::memory_order_relaxed),  "push_retry_total{result=\"error\"}");
 
+    WriteStatsEntryToFileWithHelp (fp, g_Metric_PushRejected.load (std::memory_order_relaxed), "push_rejected_total", g_szPromTypeCounter, "Total number of push requests which the receiver refused as bad data (HTTP 400). They are dropped, not kept in the WAL");
+
+    /* Only with a backup endpoint */
+    if (g_PushFailover.HasBackup())
+    {
+        WriteStatsEntryToFileWithHelp (fp, static_cast<uint64_t> (g_PushFailover.GetActive()), "push_endpoint_active", g_szPromTypeGauge, "OTLP endpoint in use: 0 is the primary, 1 is the backup");
+
+        WriteHelpAndType      (fp, "push_endpoint_requests_total", g_szPromTypeCounter, "Total number of push requests to an OTLP endpoint, labeled by endpoint and result (accepted, retry, rejected). A try of the primary while the backup is in use counts too");
+        WriteStatsEntryToFile (fp, g_PushFailover.GetRequests (PUSH_PRIMARY, PUSH_ACCEPTED), "push_endpoint_requests_total{endpoint=\"primary\",result=\"accepted\"}");
+        WriteStatsEntryToFile (fp, g_PushFailover.GetRequests (PUSH_PRIMARY, PUSH_RETRY),    "push_endpoint_requests_total{endpoint=\"primary\",result=\"retry\"}");
+        WriteStatsEntryToFile (fp, g_PushFailover.GetRequests (PUSH_PRIMARY, PUSH_REJECTED), "push_endpoint_requests_total{endpoint=\"primary\",result=\"rejected\"}");
+        WriteStatsEntryToFile (fp, g_PushFailover.GetRequests (PUSH_BACKUP,  PUSH_ACCEPTED), "push_endpoint_requests_total{endpoint=\"backup\",result=\"accepted\"}");
+        WriteStatsEntryToFile (fp, g_PushFailover.GetRequests (PUSH_BACKUP,  PUSH_RETRY),    "push_endpoint_requests_total{endpoint=\"backup\",result=\"retry\"}");
+        WriteStatsEntryToFile (fp, g_PushFailover.GetRequests (PUSH_BACKUP,  PUSH_REJECTED), "push_endpoint_requests_total{endpoint=\"backup\",result=\"rejected\"}");
+
+        WriteStatsEntryToFileWithHelp (fp, g_PushFailover.GetFailovers(), "push_failovers_total", g_szPromTypeCounter, "Number of times the backup endpoint was taken into use because the primary failed");
+        WriteStatsEntryToFileWithHelp (fp, g_PushFailover.GetFailbacks(), "push_failbacks_total", g_szPromTypeCounter, "Number of times the primary endpoint was taken into use again");
+    }
+
     if (g_IngestUnix.bEnabled || g_IngestTcp.bEnabled || g_IngestSyslog.bEnabled)
     {
         WriteHelpAndType (fp, "socket_lines_total", g_szPromTypeCounter, "Total number of lines received on socket inputs, labeled by source and result");
@@ -2448,6 +2605,155 @@ size_t GetEnvironmentValue (const char *pszEnvironmentName)
         return 0;
 
     return atoi (p);
+}
+
+
+/* A URL for the log and for -cfg: without the user name and password, and without the query and the fragment. A URL can carry
+   a secret there (https://user:password@host/path?token=...). Nothing else is changed */
+std::string SanitizeUrlForLog (const char *pszURL)
+{
+    std::string Url = pszURL ? pszURL : "";
+    size_t Cut = Url.find_first_of ("?#");
+
+    if (std::string::npos != Cut)
+        Url.erase (Cut);
+
+    size_t Scheme    = Url.find ("://");
+    size_t AuthStart = (std::string::npos == Scheme) ? 0 : Scheme + 3;
+    size_t AuthEnd   = Url.find ('/', AuthStart);
+
+    if (std::string::npos == AuthEnd)
+        AuthEnd = Url.size();
+
+    /* The user information ends at the last @ before the first slash. An @ in the path stays */
+    size_t At = Url.rfind ('@', (AuthEnd > 0) ? (AuthEnd - 1) : 0);
+
+    if ( (std::string::npos != At) && (At >= AuthStart) && (At < AuthEnd) )
+        Url.erase (AuthStart, At + 1 - AuthStart);
+
+    return Url;
+}
+
+
+/* Logs the configuration which is in use, once at every start: where the data goes, where the WAL is, what is switched on.
+   The effective values are shown, after the checks of the configuration. No secrets: the token is only shown as set or not set,
+   and the URLs are without user name, password and query. -cfg shows everything on request */
+void LogStartupSummary (bool bWalOpened)
+{
+    char szMessage[4300] = {0};
+
+    snprintf (szMessage, sizeof (szMessage), "Mode: %s", g_NoStdin ? "standalone (-nostdin), serves the socket inputs" : "pipe, reads STDIN and the socket inputs");
+    LogMessage (szMessage);
+
+    snprintf (szMessage, sizeof (szMessage), "Data directory %s, metrics file %s", g_szDataDir, g_szMetricsFileName);
+    LogMessage (szMessage);
+
+    if (IsNullStr (g_szOtlpPushApiURL))
+    {
+        LogMessage ("OTLP push is off: OTLP_PUSH_API_URL is not set. The log lines are not pushed");
+    }
+    else
+    {
+        snprintf (szMessage, sizeof (szMessage), "Push endpoint %s (token %s, CA file %s)", SanitizeUrlForLog (g_szOtlpPushApiURL).c_str(),
+                  IsNullStr (g_szOtlpPushToken) ? "not set" : "set", IsNullStr (g_szOtlpCaFile) ? "not set" : g_szOtlpCaFile);
+        LogMessage (szMessage);
+
+        if (false == IsNullStr (g_szOtlpPushApiURLBackup))
+        {
+            snprintf (szMessage, sizeof (szMessage), "Backup endpoint %s. The primary is tried again every %lu seconds while the backup is in use",
+                      SanitizeUrlForLog (g_szOtlpPushApiURLBackup).c_str(), static_cast<unsigned long> (g_FailbackSec));
+            LogMessage (szMessage);
+        }
+
+        if (bWalOpened)
+        {
+            struct stat WalStat {};
+
+            if ( (0 == stat (g_szWalFile, &WalStat)) && (WalStat.st_size > 0) )
+                snprintf (szMessage, sizeof (szMessage), "WAL %s: %lld bytes of an earlier run are pending and will be replayed", g_szWalFile, static_cast<long long> (WalStat.st_size));
+            else
+                snprintf (szMessage, sizeof (szMessage), "WAL %s", g_szWalFile);
+        }
+        else
+        {
+            snprintf (szMessage, sizeof (szMessage), "WAL %s cannot be opened: failed pushes cannot be kept", g_szWalFile);
+        }
+
+        LogMessage (szMessage);
+    }
+
+    snprintf (szMessage, sizeof (szMessage), "Resource: service.name %s, service.namespace %s, service.instance.id %s",
+              g_szOtlpServiceName, g_szServiceNamespace, g_szServiceInstanceId);
+    LogMessage (szMessage);
+
+    if ( (0 == g_NoStdin) && (false == IsNullStr (g_szOutputLogFile)) )
+    {
+        snprintf (szMessage, sizeof (szMessage), "Output log %s%s", g_szOutputLogFile, g_Mirror2Stdout ? ", mirrored to stdout" : "");
+        LogMessage (szMessage);
+    }
+    else if ( (0 == g_NoStdin) && g_Mirror2Stdout )
+    {
+        LogMessage ("STDIN is mirrored to stdout");
+    }
+}
+
+
+/* Checks the backup endpoint and the failback interval at start. A configuration which cannot work is reported and not used.
+   It must not end the program: in pipe mode the server would write into a closed pipe */
+void ValidateBackupConfig()
+{
+    const char *pFailback = getenv (g_szEnvOtlpPushFailbackSec);
+    char szMessage[300]   = {0};
+
+    if (pFailback && *pFailback)
+    {
+        char *pEnd  = NULL;
+        long  Value = strtol (pFailback, &pEnd, 10);
+
+        if ( ('\0' != *pEnd) || (Value < 1) || (Value > OTELFWD_MAX_FAILBACK_SEC) )
+        {
+            snprintf (szMessage, sizeof (szMessage), "%s has to be a number of seconds from 1 to %d. Using the default of %d seconds",
+                      g_szEnvOtlpPushFailbackSec, OTELFWD_MAX_FAILBACK_SEC, OTELFWD_DEFAULT_FAILBACK_SEC);
+            LogError (szMessage, pFailback);
+        }
+    }
+
+    if (IsNullStr (g_szOtlpPushApiURLBackup))
+    {
+        if (pFailback && *pFailback)
+        {
+            snprintf (szMessage, sizeof (szMessage), "Warning: %s has no effect without %s", g_szEnvOtlpPushFailbackSec, g_szEnvOtlpPushApiUrlBackup);
+            LogMessage (szMessage);
+        }
+
+        return;
+    }
+
+    if (IsNullStr (g_szOtlpPushApiURL))
+    {
+        snprintf (szMessage, sizeof (szMessage), "%s needs %s. The backup endpoint is not used", g_szEnvOtlpPushApiUrlBackup, g_szEnvOtlpPushApiUrl);
+        LogError (szMessage);
+        g_szOtlpPushApiURLBackup[0] = '\0';
+        return;
+    }
+
+    if ( (0 != strncasecmp (g_szOtlpPushApiURLBackup, "http://", 7)) && (0 != strncasecmp (g_szOtlpPushApiURLBackup, "https://", 8)) )
+    {
+        snprintf (szMessage, sizeof (szMessage), "%s has to start with http:// or https://. The backup endpoint is not used", g_szEnvOtlpPushApiUrlBackup);
+        LogError (szMessage, g_szOtlpPushApiURLBackup);
+        g_szOtlpPushApiURLBackup[0] = '\0';
+        return;
+    }
+
+    if (0 == strcmp (g_szOtlpPushApiURLBackup, g_szOtlpPushApiURL))
+    {
+        snprintf (szMessage, sizeof (szMessage), "Warning: %s is the same as %s. The backup endpoint is not used", g_szEnvOtlpPushApiUrlBackup, g_szEnvOtlpPushApiUrl);
+        LogMessage (szMessage);
+        g_szOtlpPushApiURLBackup[0] = '\0';
+        return;
+    }
+
+    /* A valid backup endpoint is logged with the rest of the configuration, see LogStartupSummary */
 }
 
 
@@ -2555,6 +2861,8 @@ void PrintHelp ()
     g_List.AddText ("");
 
     LogHelpEnv (g_szEnvOtlpPushApiUrl,        "OTLP/HTTP logs push URL (example: https://otel.example.com:4318/v1/logs)");
+    LogHelpEnv (g_szEnvOtlpPushApiUrlBackup,  "Optional backup OTLP/HTTP logs push URL, used when the push URL fails. Same token and CA file");
+    LogHelpEnv (g_szEnvOtlpPushFailbackSec,   "Seconds between attempts to use the push URL again while the backup is in use (default: 60 sec)");
     LogHelpEnv (g_szEnvOtlpPushToken,         "OTLP Push Token (bearer token)");
     LogHelpEnv (g_szEnvOtlpCaFile,            "OTLP Trusted Root CA File");
     LogHelpEnv (g_szEnvOtlpServiceName,       "OTLP service.name (default: domino)");
@@ -2650,7 +2958,10 @@ void DumpConfig (bool bShowEnvVars = false)
 
     g_List.AddText ("");
 
-    LogCfgText (bShowEnvVars, "OTLP Push API URL",       g_szOtlpPushApiURL,   g_szEnvOtlpPushApiUrl);
+    /* Without user name, password and query: a URL can carry a secret there */
+    LogCfgText (bShowEnvVars, "OTLP Push API URL",       SanitizeUrlForLog (g_szOtlpPushApiURL).c_str(),       g_szEnvOtlpPushApiUrl);
+    LogCfgText (bShowEnvVars, "OTLP Push API URL Backup", SanitizeUrlForLog (g_szOtlpPushApiURLBackup).c_str(), g_szEnvOtlpPushApiUrlBackup);
+    LogCfgNum  (bShowEnvVars, "OTLP Push Failback sec",  g_FailbackSec,        g_szEnvOtlpPushFailbackSec);
     LogCfgText (bShowEnvVars, "OTLP Push Token",         g_szOtlpPushToken[0] ? "(set)" : "", g_szEnvOtlpPushToken);
     LogCfgText (bShowEnvVars, "OTLP CA File",            g_szOtlpCaFile,       g_szEnvOtlpCaFile);
     LogCfgText (bShowEnvVars, "OTLP Service Name",       g_szOtlpServiceName,  g_szEnvOtlpServiceName);
@@ -2775,6 +3086,21 @@ int main (int argc, char *argv[])
     if (p)
         snprintf (g_szOtlpPushApiURL, sizeof (g_szOtlpPushApiURL), "%s", p);
 
+    p = getenv (g_szEnvOtlpPushApiUrlBackup);
+    if (p)
+        snprintf (g_szOtlpPushApiURLBackup, sizeof (g_szOtlpPushApiURLBackup), "%s", p);
+
+    /* The value is checked at start (ValidateBackupConfig): an invalid one is reported and the default is used */
+    p = getenv (g_szEnvOtlpPushFailbackSec);
+    if (p && *p)
+    {
+        char *pEnd = NULL;
+        long  Value = strtol (p, &pEnd, 10);
+
+        if ( (*pEnd == '\0') && (Value >= 1) && (Value <= OTELFWD_MAX_FAILBACK_SEC) )
+            g_FailbackSec = static_cast<size_t> (Value);
+    }
+
     p = getenv (g_szEnvOtlpPushToken);
     if (p)
         snprintf (g_szOtlpPushToken, sizeof (g_szOtlpPushToken), "%s", p);
@@ -2874,6 +3200,11 @@ int main (int argc, char *argv[])
     if (getenv ("LOKI_PUSH_API_URL"))
         LogError ("LOKI_PUSH_API_URL is not supported anymore. Version 2.0 only pushes to OTLP. Please configure OTLP_PUSH_API_URL (see README)");
 
+    ValidateBackupConfig();
+
+    /* The backup is only used if it is configured, and it is checked above: an invalid one was removed */
+    g_PushFailover.Configure (false == IsNullStr (g_szOtlpPushApiURLBackup), static_cast<time_t> (g_FailbackSec));
+
     {
         char szOldWal[2200] = {0};
         struct stat OldWalStat {};
@@ -2890,7 +3221,9 @@ int main (int argc, char *argv[])
     MakeDirectoryTreeFromFileName (g_szMetricsFileName);
 
     if (*g_szOtlpPushApiURL)
-        g_Wal.Init (g_szWalFile);
+        g_bWalOpened = g_Wal.Init (g_szWalFile);
+
+    LogStartupSummary (g_bWalOpened);
 
     curl_global_init (CURL_GLOBAL_DEFAULT);
 

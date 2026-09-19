@@ -164,6 +164,25 @@ otelfwd -nostdin
 
 `-cfg` shows the configuration as parsed so far. Put `-nostdin` before `-cfg` to see it in the output.
 
+## Log at start
+
+At every start `otelfwd` logs the configuration which is in use, to stderr, one line for each part. This is where to look first when logs do not arrive where they are expected:
+
+```text
+otelfwd: Mode: pipe, reads STDIN and the socket inputs
+otelfwd: Data directory /local/notesdata, metrics file /local/notesdata/domino/stats/otelfwd.prom
+otelfwd: Push endpoint https://otel.example.com:4318/v1/logs (token set, CA file /local/notesdata/trusted_root.pem)
+otelfwd: Backup endpoint https://otel-b.example.com:4318/v1/logs. The primary is tried again every 60 seconds while the backup is in use
+otelfwd: WAL /local/notesdata/otelfwd.wal: 610 bytes of an earlier run are pending and will be replayed
+otelfwd: Resource: service.name domino, service.namespace domino, service.instance.id domino1
+otelfwd: Output log /local/notesdata/notes.log, mirrored to stdout
+```
+
+* **The values which are really used** are shown, after the checks of the configuration. If a setting was invalid and was replaced or ignored, an error line before these lines says so, and the summary shows the result, for example no backup endpoint.
+* **No secrets.** The token is only shown as `set` or `not set`. The URLs are shown without user name, password, query and fragment, because a URL can carry a secret there (`https://user:password@host/path?token=...`). `-cfg` and `-env` do the same.
+* Without `OTLP_PUSH_API_URL` the summary says that OTLP push is off. If the WAL cannot be opened, it says so instead of a WAL line.
+* `-cfg` shows everything, also the settings which are not set. See [Command line](#command-line).
+
 ## Environment Variables
 
 By default the input is written to the output log file specified via `OTELFWD_OUTPUT_LOG`.
@@ -196,14 +215,31 @@ Most of the following parameters are optional.
 OTLP push is optional and only active when `OTLP_PUSH_API_URL` is set.
 The URL is the complete logs endpoint of the receiver. For the OpenTelemetry Collector this is `/v1/logs`, for Grafana Loki it is `/otlp/v1/logs`.
 
-| Variable Name              | Description                       | Example / Comments                      |
-| :------------------------- | :-------------------------------- | :-------------------------------------- |
-| `OTLP_PUSH_API_URL`        | OTLP/HTTP logs endpoint           | `https://otel.example.com:4318/v1/logs` |
-| `OTLP_PUSH_TOKEN`          | Bearer token for the endpoint     | `my-secure-token`                       |
-| `OTLP_CA_FILE`             | Trusted Root CA File              | `/local/notesdata/trusted_root.pem`     |
-| `OTLP_SERVICE_NAME`        | `service.name` resource attribute | default: `domino`                       |
-| `OTLP_SERVICE_NAMESPACE`   | `service.namespace`               | default: `domino`                       |
-| `OTLP_SERVICE_INSTANCE_ID` | `service.instance.id`             | default: hostname                       |
+| Variable Name              | Description                                                     | Example / Comments                        |
+| :------------------------- | :-------------------------------------------------------------- | :---------------------------------------- |
+| `OTLP_PUSH_API_URL`        | OTLP/HTTP logs endpoint                                         | `https://otel.example.com:4318/v1/logs`   |
+| `OTLP_PUSH_API_URL_BACKUP` | Optional backup endpoint, see below                             | `https://otel-b.example.com:4318/v1/logs` |
+| `OTLP_PUSH_FAILBACK_SEC`   | Seconds between tries of the primary while the backup is in use | default: `60`                             |
+| `OTLP_PUSH_TOKEN`          | Bearer token for the endpoint                                   | `my-secure-token`                         |
+| `OTLP_CA_FILE`             | Trusted Root CA File                                            | `/local/notesdata/trusted_root.pem`       |
+| `OTLP_SERVICE_NAME`        | `service.name` resource attribute                               | default: `domino`                         |
+| `OTLP_SERVICE_NAMESPACE`   | `service.namespace`                                             | default: `domino`                         |
+| `OTLP_SERVICE_INSTANCE_ID` | `service.instance.id`                                           | default: hostname                         |
+
+#### Backup endpoint
+
+`OTLP_PUSH_API_URL_BACKUP` is an optional second endpoint for the case that the first one fails. It uses the same token and CA file. Both endpoints must accept the same data, for example the same Loki tenant. Only one backup is possible, and the primary is the endpoint which `otelfwd` prefers.
+
+* **Failover:** requests go to the primary. If a request is not delivered, the same request goes to the backup. If that delivers it, the backup stays in use: the next requests go to it directly, and a failing primary does not delay them.
+* **Failback:** while the backup is in use, the primary is tried again every `OTLP_PUSH_FAILBACK_SEC` seconds (default 60, from 1 to 86400), with a real request. If it delivers, the primary is used again. If the backup fails while it is in use, the primary is tried at once.
+* **Both fail:** the request is kept in the WAL as before, and the WAL replay uses the same rules.
+* **A refused request** (HTTP 400, see [Durable Log Delivery](#durable-log-delivery)) is not sent to the other endpoint: it would refuse the same data.
+* Every change of the endpoint in use is logged once. The metrics show the endpoint and the switches, see [Metrics](#metrics).
+* **Duplicates are possible.** If an endpoint received a request but the answer was lost, the other endpoint gets the same request. Delivery is at least once.
+* **Timeouts:** a connection which is not established within 3 seconds counts as failed. A whole request has 15 seconds, the try of the primary while the backup is in use 5 seconds.
+* **Checks at start:** a backup without `OTLP_PUSH_API_URL`, one which does not start with `http://` or `https://`, or the same as the primary is reported and not used. An invalid interval is reported and 60 is used. The program keeps running.
+
+A name with several IP addresses is another way to spread over two servers: libcurl tries the next address when a connection cannot be made. It does not help when a server accepts the connection but answers with an error, which the backup endpoint covers.
 
 ### Socket inputs
 
@@ -274,6 +310,16 @@ The access log should use a JSON `log_format` with `escape=json` and OpenTelemet
 Failed log pushes are written to the WAL and replayed automatically once connectivity is restored.
 One WAL record is one push request, which can contain multiple log lines.
 The WAL file is `otelfwd.wal` in the data directory (`OTELFWD_DATA_DIR`).
+
+**What counts as delivered.** The HTTP status of the answer of the receiver decides what happens to a push request:
+
+| Answer of the receiver                                                                                                          | What happens                                                                                                                                                                                                                                                                                 |
+| :------------------------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 200 - 299                                                                                                                       | Delivered                                                                                                                                                                                                                                                                                    |
+| 400                                                                                                                             | The receiver refuses this data for good. It is **dropped**, not kept in the WAL and not sent to the backup endpoint. It is counted (`otelfwd_push_rejected_total`) and logged with the answer of the receiver. In the WAL replay only that record is dropped, the records behind it continue |
+| Everything else: no connection, timeout, 3xx (redirects are not followed), 401, 403, 404, 408, 413, 429, 500, 502, 503, 504 ... | Not delivered. The backup endpoint is tried if there is one, then the request is kept in the WAL and tried again later. The log names the status and the start of the answer                                                                                                                 |
+
+The OTLP specification retries only 429, 502, 503 and 504, and says that all other 4xx and 5xx codes must not be retried. `otelfwd` is more careful with the data. A wrong token (401), a wrong URL (404) or a size limit of the receiver (413) is a problem of the configuration which is fixed later, and dropping the logs meanwhile would lose them. Only a 400, the receiver saying that the data itself is bad, fails completely.
 
 ## Output in OTLP/HTTP JSON format
 
@@ -418,8 +464,11 @@ Both scripts print how many lines were pushed and return an error if the push fa
 | Test                     | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                             |
 | :----------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | WAL unit test            | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, speed                                                                                                             |
+| Failover unit test       | `make test`                                                                                      | a C++ compiler and `make` | Which OTLP endpoint gets a request: the backup, the failback timing, refused data, threads ([details](#unit-test-of-the-failover))                                         |
 | Load test                | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                  |
 | Load test with an outage | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                    | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end)) |
+
+`--yes` in the commands of `run_loadtest.sh` means: do not ask for the size of the test. Without it, the script asks in a terminal for the number of threads and requests, and Enter takes the default (8 threads with 10,000 requests each). `./nginx/run_loadtest.sh --help` lists all options of the script and of the load test program.
 
 ### Unit test of the WAL
 
@@ -429,7 +478,7 @@ Both scripts print how many lines were pushed and return an error if the push fa
 make test
 ```
 
-`make` compiles the test when a source changed, and runs it. If a check fails, `make` ends with an error. The test can also be started directly:
+`make test` compiles the tests when a source changed, and runs them: this one and the [failover test](#unit-test-of-the-failover). All of them run even if one fails, and `make` ends with an error if a check failed. This test can also be started directly:
 
 ```bash
 ./wal_unit_test
@@ -517,6 +566,16 @@ Write a function in `wal_unit_test.cpp` and call it from `main` in the fitting s
 
 The former program `wal_test` (a speed test without checks) is part of this test now: the producer and consumer test checks that every record arrives once and in order, and the performance section prints the speed.
 
+### Unit test of the failover
+
+`push_failover_test.cpp` tests the decisions of `push_failover.hpp`: which endpoint gets a push request. There is no network. The failover object does not send anything: the test gives it a function which answers what the test says (delivered, not delivered, or refused) and writes down which endpoint was called (`P` primary, `p` primary tried again while the backup is in use, `B` backup). Time is a parameter, so the 60 seconds of the failback need no waiting.
+
+```bash
+./push_failover_test
+```
+
+It checks: no backup, a working primary, the failover and that the backup stays in use, both endpoints failing, refused data (not sent to the other endpoint), the failback at exactly the configured time (not a second before), the immediate try of the primary when the backup fails, the statistics, and threads: when the probe of the primary is due and 8 threads send at the same second, exactly one of them makes it. The output has the same sections and `[PASS]` / `[FAIL]` lines as the WAL test.
+
 ### Test receiver and load test
 
 `tools/otel-sink` is a test container with an OTLP/HTTP receiver: NGINX in front (HTTP, HTTPS with a generated certificate, a bearer token check, a port which always fails) and a small program which writes every POST to its own JSON file.
@@ -530,6 +589,18 @@ The whole path can be load tested: `nginx/run_loadtest.sh` starts the sink, `ote
 
 ```bash
 ./nginx/run_loadtest.sh
+```
+
+### Load test with a backup endpoint and with refused data
+
+Two options of the load test check the two endpoints of `otelfwd` with the same sink. `--backup` makes the primary endpoint fail and requires that every event arrives through the backup. `--reject` makes the primary answer `400` and requires that nothing arrives: the data is dropped, not kept in the WAL and not sent to the backup. See [Failover and refused data](nginx/README.md#failover-and-refused-data).
+
+```bash
+./nginx/run_loadtest.sh --backup --yes --threads 4 --requests 2000
+```
+
+```bash
+./nginx/run_loadtest.sh --reject --yes --threads 4 --requests 2000
 ```
 
 ### Load test with an outage: the WAL end to end
@@ -548,15 +619,20 @@ The whole path can be load tested: `nginx/run_loadtest.sh` starts the sink, `ote
 
 Metrics are written to the Prometheus file (`OTELFWD_PROM_FILE`) every 10 seconds and at shutdown.
 
-| Metric                                              | Description                                                                  |
-| :-------------------------------------------------- | :--------------------------------------------------------------------------- |
-| `otelfwd_lines_received_total`                      | Log lines received (STDIN and sockets)                                       |
-| `otelfwd_push_total{result="success\|error"}`       | Log lines pushed, by result                                                  |
-| `otelfwd_push_retry_total{result="success\|error"}` | WAL records (one push request each) replayed, by result                      |
-| `otelfwd_socket_lines_total{source,result}`         | Lines received on a socket input. `result`: `accepted`, `dropped`, `invalid` |
-| `otelfwd_socket_connections_total{source,result}`   | Connections on a socket input. `result`: `accepted`, `rejected`              |
+| Metric                                                  | Description                                                                                                                                               |
+| :------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `otelfwd_lines_received_total`                          | Log lines received (STDIN and sockets)                                                                                                                    |
+| `otelfwd_push_total{result="success\|error"}`           | Log lines pushed, by result                                                                                                                               |
+| `otelfwd_push_retry_total{result="success\|error"}`     | WAL records (one push request each) replayed, by result                                                                                                   |
+| `otelfwd_push_rejected_total`                           | Push requests which the receiver refused as bad data (HTTP 400) and which were dropped                                                                    |
+| `otelfwd_push_endpoint_active`                          | Gauge. The endpoint in use: 0 is the primary, 1 is the backup                                                                                             |
+| `otelfwd_push_endpoint_requests_total{endpoint,result}` | Push requests to an endpoint (`primary`, `backup`). `result`: `accepted`, `retry`, `rejected`. A try of the primary while the backup is in use counts too |
+| `otelfwd_push_failovers_total`                          | Times the backup was taken into use because the primary failed                                                                                            |
+| `otelfwd_push_failbacks_total`                          | Times the primary was taken into use again                                                                                                                |
+| `otelfwd_socket_lines_total{source,result}`             | Lines received on a socket input. `result`: `accepted`, `dropped`, `invalid`                                                                              |
+| `otelfwd_socket_connections_total{source,result}`       | Connections on a socket input. `result`: `accepted`, `rejected`                                                                                           |
 
-`source` is `unix`, `tcp` or `syslog`. The socket metrics are only written for enabled inputs. The syslog input is a datagram socket and has no connection metrics.
+The `otelfwd_push_endpoint_*`, `failovers` and `failbacks` metrics are only written if a backup endpoint is configured. `source` is `unix`, `tcp` or `syslog`. The socket metrics are only written for enabled inputs. The syslog input is a datagram socket and has no connection metrics.
 
 ## Migration from version 1.x
 

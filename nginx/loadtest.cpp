@@ -88,6 +88,8 @@ struct Config
     int         StallSec   = 15;            /* stop waiting when nothing new arrived for this long */
     int         FailForSec = 0;             /* WAL test: the sink answers 503 for this many seconds */
     bool        bVerbose   = false;
+    bool        bExpectFailover = false;    /* the primary endpoint of otelfwd fails: everything has to arrive through the backup */
+    bool        bExpectReject   = false;    /* the primary endpoint refuses the data with 400: nothing arrives, nothing goes to the backup */
 };
 
 
@@ -560,6 +562,10 @@ static void PrintHelp()
             "  --otelfwd-prom FILE  metrics file of otelfwd (<data dir>/domino/stats/otelfwd.prom): shows where events were lost\n"
             "  --fail-for SEC       WAL test: the sink answers 503 for this many seconds. otelfwd retries from its WAL after that.\n"
             "                       Its WAL retry waits up to 2 minutes, so use --wait 300 or more\n"
+            "  --expect-failover    the primary endpoint of otelfwd fails (503) and there is a backup endpoint. The test passes if every event\n"
+            "                       arrived through the backup, and otelfwd made a failover. Needs --otelfwd-prom. run_loadtest.sh --backup sets it up\n"
+            "  --expect-reject      the primary endpoint refuses the data with 400 and there is a backup endpoint. The test passes if NOTHING arrived:\n"
+            "                       the data is dropped, not kept for a retry, and not sent to the backup. Needs --otelfwd-prom. run_loadtest.sh --reject sets it up\n"
             "  --verbose            list every thread\n\n"
             "Exit code: 0 PASS, 1 FAIL, 2 the test could not run\n");
 }
@@ -581,6 +587,14 @@ static bool ParseArgs (int argc, char *argv[], Config& Cfg)
         else if ("--verbose" == Arg)
         {
             Cfg.bVerbose = true;
+        }
+        else if ("--expect-failover" == Arg)
+        {
+            Cfg.bExpectFailover = true;
+        }
+        else if ("--expect-reject" == Arg)
+        {
+            Cfg.bExpectReject = true;
         }
         else if ( ("--nginx" == Arg) || ("--sink" == Arg) || ("--token" == Arg) || ("--otelfwd-prom" == Arg) || ("--threads" == Arg) ||
                   ("--requests" == Arg) || ("--rate" == Arg) || ("--timeout" == Arg) || ("--wait" == Arg) || ("--stall" == Arg) || ("--fail-for" == Arg) )
@@ -615,6 +629,18 @@ static bool ParseArgs (int argc, char *argv[], Config& Cfg)
     if ( (0 == Cfg.Threads) || (0 == Cfg.Requests) || (Cfg.TimeoutSec < 1) || (Cfg.WaitSec < 0) || (Cfg.StallSec < 1) || (Cfg.Rate < 0) || (Cfg.FailForSec < 0) )
     {
         fprintf (stderr, "invalid value. See --help\n");
+        return false;
+    }
+
+    if (Cfg.bExpectFailover && Cfg.bExpectReject)
+    {
+        fprintf (stderr, "--expect-failover and --expect-reject cannot be used together\n");
+        return false;
+    }
+
+    if ( (Cfg.bExpectFailover || Cfg.bExpectReject) && Cfg.PromFile.empty() )
+    {
+        fprintf (stderr, "--expect-failover and --expect-reject need --otelfwd-prom: the result is in the metrics of otelfwd\n");
         return false;
     }
 
@@ -910,7 +936,68 @@ int main (int argc, char *argv[])
             printf ("  lines pushed ok / failed     : %.0f / %.0f\n", PushOk, PushErr);
             printf ("  WAL requests replayed ok/fail: %.0f / %.0f\n", RetryOk, RetryErr);
 
-            if (Missing > 0)
+            /* The endpoints of otelfwd: there is a backup endpoint if otelfwd writes its endpoint metrics */
+            auto   Delta      = [&] (const char *pszName) { return Metric (PromAfter, pszName) - Metric (PromBefore, pszName); };
+            bool   bEndpoints = (PromAfter.Values.count ("otelfwd_push_endpoint_active") > 0);
+            double Rejected   = Delta ("otelfwd_push_rejected_total");
+            double Failovers  = Delta ("otelfwd_push_failovers_total");
+            double Failbacks  = Delta ("otelfwd_push_failbacks_total");
+            double PrimaryOk  = Delta ("otelfwd_push_endpoint_requests_total{endpoint=\"primary\",result=\"accepted\"}");
+            double PrimaryRet = Delta ("otelfwd_push_endpoint_requests_total{endpoint=\"primary\",result=\"retry\"}");
+            double PrimaryRej = Delta ("otelfwd_push_endpoint_requests_total{endpoint=\"primary\",result=\"rejected\"}");
+            double BackupOk   = Delta ("otelfwd_push_endpoint_requests_total{endpoint=\"backup\",result=\"accepted\"}");
+            double BackupRet  = Delta ("otelfwd_push_endpoint_requests_total{endpoint=\"backup\",result=\"retry\"}");
+            double BackupRej  = Delta ("otelfwd_push_endpoint_requests_total{endpoint=\"backup\",result=\"rejected\"}");
+
+            if (bEndpoints || (Rejected > 0))
+            {
+                printf ("\n== otelfwd endpoints (change during the test) ==\n");
+
+                if (bEndpoints)
+                {
+                    printf ("  requests to the primary      : %.0f accepted / %.0f not accepted / %.0f refused as bad data (400)\n", PrimaryOk, PrimaryRet, PrimaryRej);
+                    printf ("  requests to the backup       : %.0f accepted / %.0f not accepted / %.0f refused as bad data (400)\n", BackupOk, BackupRet, BackupRej);
+                    printf ("  failovers / failbacks        : %.0f / %.0f\n", Failovers, Failbacks);
+                    printf ("  endpoint in use at the end   : %s\n", (Metric (PromAfter, "otelfwd_push_endpoint_active") >= 1) ? "backup" : "primary");
+                }
+
+                printf ("  push requests refused (400)  : %.0f  (dropped, not kept in the WAL)\n", Rejected);
+            }
+
+            /* --expect-failover: the primary fails, so the events have to arrive through the backup */
+            if (Cfg.bExpectFailover)
+            {
+                if (false == bEndpoints)
+                {
+                    Reasons.push_back ("otelfwd writes no endpoint metrics: it has no backup endpoint (--expect-failover)");
+                }
+                else
+                {
+                    if (Failovers < 1)
+                        Reasons.push_back ("otelfwd made no failover to the backup endpoint (--expect-failover)");
+
+                    if (BackupOk < 1)
+                        Reasons.push_back ("the backup endpoint accepted no request (--expect-failover)");
+                }
+            }
+
+            /* --expect-reject: the primary refuses the data with 400. It is dropped: not delivered, not kept, not sent to the backup */
+            if (Cfg.bExpectReject)
+            {
+                if (Rejected < 1)
+                    Reasons.push_back ("the primary endpoint refused nothing: otelfwd_push_rejected_total did not grow (--expect-reject)");
+
+                if (PushOk > 0)
+                    Reasons.push_back (std::to_string (static_cast<long long>(PushOk)) + " lines were pushed although the data is refused (--expect-reject)");
+
+                if ( (PushErr > 0) || (RetryOk > 0) || (RetryErr > 0) )
+                    Reasons.push_back ("refused data was kept for a retry in the WAL (--expect-reject)");
+
+                if ( bEndpoints && ((Failovers > 0) || ((BackupOk + BackupRet + BackupRej) > 0)) )
+                    Reasons.push_back ("refused data was sent to the backup endpoint (--expect-reject)");
+            }
+
+            if ( (Missing > 0) && (false == Cfg.bExpectReject) )
             {
                 /* What otelfwd saw at its syslog socket for test events: accepted into its queue, dropped because the queue was
                    full, or invalid. Lines which are not test events do not count: they take the place of a lost event */
@@ -954,6 +1041,10 @@ int main (int argc, char *argv[])
                     printf ("  HINT: otelfwd accepted everything. The events are lost after it: check the push errors above, its WAL, or the sink.\n");
             }
         }
+        else if (Cfg.bExpectFailover || Cfg.bExpectReject)
+        {
+            Reasons.push_back ("the metrics file of otelfwd could not be read: the expectation of --expect-failover or --expect-reject cannot be checked");
+        }
 
         if (Stats.HasMember ("missing_sample") && Stats["missing_sample"].IsArray() && (Stats["missing_sample"].Size() > 0))
         {
@@ -988,7 +1079,12 @@ int main (int argc, char *argv[])
         }
 
         if (g_Abort.load())                Reasons.push_back ("the test was aborted");
-        if (Missing > 0)                   Reasons.push_back (std::to_string (Missing) + " events missing");
+        if ( (Missing > 0) && (false == Cfg.bExpectReject) )
+            Reasons.push_back (std::to_string (Missing) + " events missing");
+
+        if ( Cfg.bExpectReject && (Unique > 0) )
+            Reasons.push_back (std::to_string (Unique) + " events arrived at the sink although the primary endpoint refuses them: refused data must not be sent to the backup (--expect-reject)");
+
         if (Unexpected > 0)                Reasons.push_back (std::to_string (Unexpected) + " unexpected events");
         if (Malformed > 0)                 Reasons.push_back (std::to_string (Malformed) + " malformed test paths");
         if (Conflicts > 0)                 Reasons.push_back (std::to_string (Conflicts) + " events with conflicting time stamps (records of an earlier run in the WAL?)");
@@ -1000,7 +1096,14 @@ int main (int argc, char *argv[])
 
     if (Reasons.empty())
     {
-        printf ("RESULT: PASS  (every event arrived%s)\n", GetU64 (Stats, "duplicates") ? ", some more than once: at least once delivery" : " exactly once");
+        if (Cfg.bExpectReject)
+        {
+            printf ("RESULT: PASS  (the primary endpoint refused the data with 400: it was dropped, not kept for a retry and not sent to the backup)\n");
+            return 0;
+        }
+
+        printf ("RESULT: PASS  (every event arrived%s%s)\n", GetU64 (Stats, "duplicates") ? ", some more than once: at least once delivery" : " exactly once",
+                Cfg.bExpectFailover ? ", through the backup endpoint after a failover" : "");
         return 0;
     }
 

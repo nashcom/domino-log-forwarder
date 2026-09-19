@@ -4,7 +4,7 @@ LDFLAGS  = -lcurl
 
 # Targets
 TARGET  = otelfwd
-TARGET_TEST = wal_unit_test
+TARGET_TEST = wal_unit_test push_failover_test
 
 # Common sources
 WAL_SRC  = simple_wal.cpp
@@ -15,9 +15,9 @@ WAL_HDR  = simple_wal.hpp
 
 all: $(TARGET)
 
-# Builds and runs the unit test of the WAL
+# Builds and runs the unit tests: the WAL, and the failover between two OTLP endpoints. All of them run, even if one fails
 test: $(TARGET_TEST)
-	./$(TARGET_TEST)
+	@fail=0; for t in $(TARGET_TEST); do ./$$t || fail=1; done; exit $$fail
 
 otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR)
 	$(CXX) $(CXXFLAGS) -o $@ otelfwd.cpp $(WAL_SRC) $(LDFLAGS)
@@ -26,6 +26,10 @@ otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR)
 # --wrap lets the test make ftruncate and unlink fail on request (fault injection), without any test code in the WAL
 wal_unit_test: wal_unit_test.cpp $(WAL_SRC) $(WAL_HDR)
 	$(CXX) $(CXXFLAGS) -pthread -Wl,--wrap=ftruncate -Wl,--wrap=unlink -o $@ wal_unit_test.cpp $(WAL_SRC)
+
+# Unit test of the decisions in push_failover.hpp: which OTLP endpoint gets a request. No network
+push_failover_test: push_failover_test.cpp push_failover.hpp push_status.hpp
+	$(CXX) $(CXXFLAGS) -pthread -o $@ push_failover_test.cpp
 
 # Test tool: receiving end of the OTLP test container, see tools/otel-sink/. Not part of "all".
 #   make otel-sink                needs rapidjson and zlib headers

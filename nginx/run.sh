@@ -18,6 +18,8 @@
 # Settings (environment variables):
 #
 #   OTLP_PUSH_API_URL      where otelfwd pushes to. Default: http://127.0.0.1:4318/v1/logs (the OTLP test container in tools/otel-sink)
+#   OTLP_PUSH_API_URL_BACKUP   optional backup endpoint of otelfwd, used when the first one fails (see the README of the repository)
+#   OTLP_PUSH_FAILBACK_SEC     seconds between the tries of the first endpoint while the backup is in use (default 60)
 #   OTLP_PUSH_TOKEN        bearer token, if the receiver needs one
 #   OTLP_CA_FILE           CA file for https://
 #   OTELFWD_BIN            the forwarder. Default: ../otelfwd (built with "make"), otherwise otelfwd from the PATH
@@ -78,6 +80,19 @@ if ! command -v docker >/dev/null 2>&1; then
   echo "docker was not found" >&2
   exit 2
 fi
+
+
+# A URL for the console: without user name, password, query and fragment, because a URL can carry a secret there
+safe_url()
+{
+  local Url="${1%%[?#]*}"
+
+  if [[ "$Url" =~ ^([a-zA-Z][a-zA-Z0-9+.-]*://)([^/]*@)?(.*)$ ]]; then
+    Url="${BASH_REMATCH[1]}${BASH_REMATCH[3]}"
+  fi
+
+  echo "$Url"
+}
 
 
 # Stops an otelfwd by the pid in its pid file, if that pid still is an otelfwd. Nothing else is touched.
@@ -260,7 +275,12 @@ fi
 
 echo "Starting otelfwd: $OTELFWD_BIN -nostdin"
 echo "  syslog socket : $SOCKET"
-echo "  OTLP endpoint : $OTLP_PUSH_API_URL"
+echo "  OTLP endpoint : $(safe_url "$OTLP_PUSH_API_URL")"
+
+if [ -n "${OTLP_PUSH_API_URL_BACKUP:-}" ]; then
+  echo "  OTLP backup   : $(safe_url "$OTLP_PUSH_API_URL_BACKUP") (the primary is tried again every ${OTLP_PUSH_FAILBACK_SEC:-60} seconds while it is in use)"
+fi
+
 echo "  data directory: $OTELFWD_DATA_DIR"
 
 if [ "$DETACH" = "1" ]; then

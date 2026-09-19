@@ -127,14 +127,15 @@ docker exec otelfwd-test-nginx tail -f /var/log/nginx/access_test.log
 
 `--detach`, `--rebuild` and `--clean` can be combined. Without `--rebuild` the image is still built again when its files changed (`up --build`), using the build cache.
 
-| Setting (environment variable)    | Default                                                                                                                                                                   |
-| :-------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `OTLP_PUSH_API_URL`               | `http://127.0.0.1:4318/v1/logs` (the OTLP test container in `tools/otel-sink`)                                                                                            |
-| `OTLP_PUSH_TOKEN`, `OTLP_CA_FILE` | not set                                                                                                                                                                   |
-| `OTELFWD_NGINX_PORT`              | `18080` on `127.0.0.1` of the host. The container uses the network of the host, so this is the real port of NGINX. It has to be free on the host                          |
-| `OTELFWD_BIN`                     | `../otelfwd` (built with `make`), otherwise `otelfwd` from the `PATH`                                                                                                     |
-| `OTELFWD_SOCKET_DIR`              | `/tmp/otelfwd-syslog`. `/mnt/...` is refused                                                                                                                              |
-| `OTELFWD_DATA_DIR`                | `otelfwd-data` next to `run.sh` (WAL and metrics, git-ignored). It is separate from the data directory of any other `otelfwd`, because two instances must not share a WAL |
+| Setting (environment variable)                       | Default                                                                                                                                                                   |
+| :--------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `OTLP_PUSH_API_URL`                                  | `http://127.0.0.1:4318/v1/logs` (the OTLP test container in `tools/otel-sink`)                                                                                            |
+| `OTLP_PUSH_API_URL_BACKUP`, `OTLP_PUSH_FAILBACK_SEC` | not set, 60. Passed on to `otelfwd`, see the [backup endpoint](../README.md#backup-endpoint). `run.sh` prints the backup at start, `run_loadtest.sh --backup` sets it     |
+| `OTLP_PUSH_TOKEN`, `OTLP_CA_FILE`                    | not set                                                                                                                                                                   |
+| `OTELFWD_NGINX_PORT`                                 | `18080` on `127.0.0.1` of the host. The container uses the network of the host, so this is the real port of NGINX. It has to be free on the host                          |
+| `OTELFWD_BIN`                                        | `../otelfwd` (built with `make`), otherwise `otelfwd` from the `PATH`                                                                                                     |
+| `OTELFWD_SOCKET_DIR`                                 | `/tmp/otelfwd-syslog`. `/mnt/...` is refused                                                                                                                              |
+| `OTELFWD_DATA_DIR`                                   | `otelfwd-data` next to `run.sh` (WAL and metrics, git-ignored). It is separate from the data directory of any other `otelfwd`, because two instances must not share a WAL |
 
 ### How the socket gets into the container
 
@@ -201,12 +202,15 @@ The build needs the rapidjson headers.
 
 ### Options of run_loadtest.sh
 
-| Option of `run_loadtest.sh` | Meaning                                                             |
-| :-------------------------- | :------------------------------------------------------------------ |
-| `--keep`                    | Leave everything running afterwards                                 |
-| `--rebuild`                 | Remove the images and build them again without the build cache      |
-| `--yes`                     | Do not ask for the size of the test                                 |
-| all others                  | Go to `loadtest`, see [Options of `loadtest`](#options-of-loadtest) |
+| Option of `run_loadtest.sh` | Meaning                                                                                 |
+| :-------------------------- | :-------------------------------------------------------------------------------------- |
+| `--keep`                    | Leave everything running afterwards                                                     |
+| `--rebuild`                 | Remove the images and build them again without the build cache                          |
+| `--help`, `-h`              | List the options of this script and of `loadtest`, and end. Nothing is built or started |
+| `--yes`                     | Do not ask for the size of the test                                                     |
+| `--backup`                  | Failover test, see [Failover and refused data](#failover-and-refused-data)              |
+| `--reject`                  | Test of refused data, see [Failover and refused data](#failover-and-refused-data)       |
+| all others                  | Go to `loadtest`, see [Options of `loadtest`](#options-of-loadtest)                     |
 
 **A sink which is already running** (port 4318, for example one started from another directory) is looked at first: if it answers `/test/stats` like the current sink, it is used as it is and left running. An older sink without the load test ledger is refused with a message, because it cannot count the events. Stop it and run the script again, it then builds the current image. `OTEL_SINK_PORT` selects another port for the sink. The push URL of `otelfwd` follows it unless `OTLP_PUSH_API_URL` is set.
 
@@ -231,18 +235,44 @@ Every request is `GET /otelfwd-test/<thread>/<count>/<sent_ns>`. NGINX answers i
 
 ### Options of `loadtest`
 
-| Option                                 | Default                  | Meaning                                                                                       |
-| :------------------------------------- | :----------------------- | :-------------------------------------------------------------------------------------------- |
-| `--threads N`                          | 8                        | Sender threads                                                                                |
-| `--requests N`                         | 10000                    | Requests per thread                                                                           |
-| `--rate N`                             | 0 (as fast as possible)  | Requests per second and thread. Bursts and a steady load fail differently                     |
-| `--wait SEC`                           | 60                       | How long to wait for the last events after the last request                                   |
-| `--stall SEC`                          | 15                       | Stop waiting when nothing new arrived for this long                                           |
-| `--timeout SEC`                        | 10                       | Timeout of one HTTP request                                                                   |
-| `--fail-for SEC`                       | 0                        | WAL test: the sink answers `503` for this long, then recovers                                 |
-| `--otelfwd-prom FILE`                  | set by `run_loadtest.sh` | Metrics file of `otelfwd`. Shows where events were lost. `otelfwd` writes it every 10 seconds |
-| `--nginx URL` `--sink URL` `--token T` | ports of the containers  | Where the test NGINX and the sink are                                                         |
-| `--verbose`                            |                          | Lists every thread                                                                            |
+| Option                                 | Default                  | Meaning                                                                                                                                                                    |
+| :------------------------------------- | :----------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--threads N`                          | 8                        | Sender threads                                                                                                                                                             |
+| `--requests N`                         | 10000                    | Requests per thread                                                                                                                                                        |
+| `--rate N`                             | 0 (as fast as possible)  | Requests per second and thread. Bursts and a steady load fail differently                                                                                                  |
+| `--wait SEC`                           | 60                       | How long to wait for the last events after the last request                                                                                                                |
+| `--stall SEC`                          | 15                       | Stop waiting when nothing new arrived for this long                                                                                                                        |
+| `--timeout SEC`                        | 10                       | Timeout of one HTTP request                                                                                                                                                |
+| `--fail-for SEC`                       | 0                        | WAL test: the sink answers `503` for this long, then recovers                                                                                                              |
+| `--otelfwd-prom FILE`                  | set by `run_loadtest.sh` | Metrics file of `otelfwd`. Shows where events were lost. `otelfwd` writes it every 10 seconds                                                                              |
+| `--nginx URL` `--sink URL` `--token T` | ports of the containers  | Where the test NGINX and the sink are                                                                                                                                      |
+| `--expect-failover`                    |                          | The primary endpoint of `otelfwd` fails and there is a backup. Passes only if every event arrived through the backup and `otelfwd` made a failover. Needs `--otelfwd-prom` |
+| `--expect-reject`                      |                          | The primary endpoint refuses the data with 400 and there is a backup. Passes only if nothing arrived. Needs `--otelfwd-prom`                                               |
+| `--verbose`                            |                          | Lists every thread                                                                                                                                                         |
+
+### Failover and refused data
+
+`otelfwd` can have a backup endpoint (`OTLP_PUSH_API_URL_BACKUP`, see the [main README](../README.md#backup-endpoint)). The test sink has a port which always fails (4320), so two options of `run_loadtest.sh` test the two endpoints without any other tool. They start `otelfwd` with the failing port as the primary endpoint and the normal port (4318) as the backup.
+
+| Option     | The primary answers                 | What has to happen                                                                                    |
+| :--------- | :---------------------------------- | :---------------------------------------------------------------------------------------------------- |
+| `--backup` | `503` (the default of the sink)     | `otelfwd` makes a failover. **Every** event arrives at the sink through the backup, exactly once      |
+| `--reject` | `400` (`OTEL_SINK_FAIL_STATUS=400`) | **Nothing** arrives. The data is dropped: not kept in the WAL for a retry, and not sent to the backup |
+
+```bash
+./run_loadtest.sh --backup --yes --threads 4 --requests 2000
+```
+
+```bash
+./run_loadtest.sh --reject --yes --threads 4 --requests 2000
+```
+
+* **What the report shows:** the block `otelfwd endpoints` lists the requests to the primary and to the backup, the failovers and the endpoint in use at the end. For `--backup` the result is `PASS` with the note that the events came through the backup. For `--reject` it is `PASS` with the note that the data was refused and dropped.
+* **What makes it fail:** for `--backup`, missing events, no failover, or no request accepted by the backup. For `--reject`, events which arrived at the sink, data which was kept in the WAL for a retry, data which was sent to the backup, or no refusal counted at all (`otelfwd_push_rejected_total`).
+* **The status of the failing port** is set when the sink starts (`OTEL_SINK_FAIL_STATUS`, 503 by default, and `--reject` sets 400). A sink which is already running keeps its setting, so the script asks the port before it starts anything. If the status does not fit, it stops with a message and tells to stop the sink. Nothing else is touched.
+* **Failback** (going back to the primary) is not part of these tests, because the failing port never recovers. It is covered by the [unit test of the failover](../README.md#unit-test-of-the-failover). To see it in a load test the sink would need a switch which makes one port work again.
+* Both options work with `--fail-for`. The failing time then applies to both ports, so both endpoints fail for that time, and the events go to the WAL.
+* These two options were tested with a fake environment for the verdict, not with the containers. Please run each once and tell if the containers behave differently.
 
 ### The result
 
