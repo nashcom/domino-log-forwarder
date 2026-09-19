@@ -22,22 +22,25 @@ The repository has two programs which work together, and some tools to test them
 ```text
 Domino console (STDOUT) ─── STDIN ───────────┐
                                              │
-domfwd (Domino events) ──── UNIX socket ─────┤
+domfwd (Domino events) ──── UNIX Socket ─────┤
                                              │
-other local producer ────── TCP 127.0.0.1 ───┤
+Other local producer ────── TCP 127.0.0.1 ───┤
                                              │
-NGINX (syslog) ──────────── UNIX datagram ───┤
+NGINX (syslog) ──────────── UNIX Datagram ───┤
+                                             │
                                              ▼
                                           otelfwd
                                              │
-                                             ├── batching
+                                             ├── Batching
                                              ├── WAL / retry
-                                             ├── resource/scope grouping
+                                             ├── Resource/scope grouping
                                              └── OTLP/HTTP JSON
+                                                     │
                                                      │  HTTP(S) over TCP, outbound
                                                      │  configurable URL, OTLP default port 4318
+                                                     │
                                                      ▼
-                                           any OTLP receiver
+                                           Any OTLP Receiver
                                         (tested with Grafana Loki)
 ```
 
