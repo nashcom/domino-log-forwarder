@@ -1,5 +1,5 @@
 CXX      = g++
-CXXFLAGS = -O2 -Wall -pedantic -flto
+CXXFLAGS = -O2 -Wall -pedantic -flto -Iwal
 LDFLAGS  = -static -flto
 LDLIBS   = $(shell pkg-config --static --libs libcurl)
 
@@ -11,10 +11,10 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
-otelfwd.o: otelfwd.cpp push_status.hpp push_failover.hpp otlp_protobuf.hpp log_line.hpp
+otelfwd.o: otelfwd.cpp wal/simple_wal.hpp push_status.hpp push_failover.hpp otlp_protobuf.hpp log_line.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-simple_wal.o: simple_wal.cpp simple_wal.hpp log_line.hpp
+simple_wal.o: wal/simple_wal.cpp wal/simple_wal.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:

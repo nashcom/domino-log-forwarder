@@ -1,5 +1,6 @@
 
-/* Unit test of what happens to a push request before and while it is sent. There is no network in any of it.
+/* Unit test of the pieces of otelfwd which need no network and no other program: the failover between two endpoints, the converter
+   from JSON to protobuf, and the format of the log lines.
 
    1. The decisions in push_failover.hpp: which endpoint a push request goes to, when the backup is used, and when the primary
       is tried again. The test gives the failover a function which sends nothing and answers what the test says, and it writes
@@ -18,7 +19,10 @@
       A tag is (field number << 3) | wire type: 0A is field 1 with a length, 12 is field 2 with a length, 09 is field 1 with 8 fixed
       bytes. A length is a varint: 7 bits at a time, the top bit says that another byte follows
 
-   Build and run:  make push_failover_test && ./push_failover_test        (or: make test)
+   3. The console output of otelfwd (log_line.hpp): the time stamp in UTC, the two blanks, the process name, the level. The times
+      are what the date command says for the same number of seconds, also when the host time zone is far from UTC.
+
+   Build and run:  make otelfwd_unit_test && ./otelfwd_unit_test        (or: make test)
 
    Every check prints [PASS] or [FAIL]. The end of the output has a section "Failed checks" (only if there are any) and a
    section "Result". The exit code is 0 if every check passed and 1 if any check failed. */
@@ -26,14 +30,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <atomic>
+#include <functional>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include "push_failover.hpp"
 #include "otlp_protobuf.hpp"
+#include "log_line.hpp"
 
 
 static int g_Total  = 0;
@@ -689,11 +696,167 @@ static void TestRefused ()
 }
 
 
+/* Returns what the action writes to stderr. The action must not print a check: it would be captured too */
+static std::string CaptureStderr (const std::function<void()>& Action)
+{
+    char szPath[] = "/tmp/otelfwd_unit_test_XXXXXX";
+    std::string Result;
+    char   szBuffer[512];
+    size_t Read = 0;
+
+    int fdNew = ::mkstemp (szPath);
+
+    if (fdNew < 0)
+        return Result;
+
+    fflush (stderr);
+
+    int fdOld = ::dup (2);
+
+    ::dup2 (fdNew, 2);
+    ::close (fdNew);
+
+    Action();
+
+    fflush (stderr);
+    ::dup2 (fdOld, 2);
+    ::close (fdOld);
+
+    FILE *fp = fopen (szPath, "r");
+
+    if (fp)
+    {
+        while ((Read = fread (szBuffer, 1, sizeof (szBuffer), fp)) > 0)
+            Result.append (szBuffer, Read);
+
+        fclose (fp);
+    }
+
+    ::unlink (szPath);
+
+    return Result;
+}
+
+
+/* ============================== Log lines ============================== */
+
+
+/* The start of the text is "dddd-dd-ddTdd:dd:ddZ" and two blanks, with digits in place of the d. A check of the shape, which does
+   not use the code which makes it */
+static bool StartsWithTimestamp (const std::string& Text)
+{
+    static const char szShape[] = "dddd-dd-ddTdd:dd:ddZ  ";
+    size_t Len = sizeof (szShape) - 1;
+
+    if (Text.size() < Len)
+        return false;
+
+    for (size_t i = 0; i < Len; i++)
+    {
+        if ('d' == szShape[i])
+        {
+            if ( (Text[i] < '0') || (Text[i] > '9') )
+                return false;
+        }
+        else if (Text[i] != szShape[i])
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+
+/* The times are what the date command says for the same number of seconds: date -u -d @NUMBER */
+static void TestLogTime ()
+{
+    /* The time is UTC whatever the time zone of the host is. A zone 12 hours away shows a local time as a difference:
+       the POSIX form NZST-12 needs no time zone database on the host */
+    const char *pszOldZone = getenv ("TZ");
+    std::string OldZone    = pszOldZone ? pszOldZone : "";
+
+    ::setenv ("TZ", "NZST-12", 1);
+    ::tzset();
+
+    Check ("1970-01-01T00:00:00Z" == FormatLogTime (0),            "log time: 0 is the start of 1970 in UTC, also when the host time zone is 12 hours ahead");
+    Check ("2000-02-29T00:00:00Z" == FormatLogTime (951782400),    "log time: a leap day");
+    Check ("2026-09-19T21:07:09Z" == FormatLogTime (1789852029),   "log time: a time of today (the metrics timestamp of the WAL retry test)");
+    Check ("2030-01-01T00:00:00Z" == FormatLogTime (1893456000),   "log time: the start of a year");
+    Check ("2038-01-19T03:14:08Z" == FormatLogTime (2147483648LL), "log time: the second after the 32 bit limit");
+
+    if (pszOldZone)
+        ::setenv ("TZ", OldZone.c_str(), 1);
+    else
+        ::unsetenv ("TZ");
+
+    ::tzset();
+}
+
+
+static void TestLogLine ()
+{
+    Check ("1970-01-01T00:00:00Z  otelfwd: [Error] message: text\n" == FormatLogLine (0, "otelfwd", "Error", "message", "text"),
+           "log line: time, two blanks, process name, level, message, text");
+
+    Check ("1970-01-01T00:00:00Z  [Error] message: text\n" == FormatLogLine (0, NULL, "Error", "message", "text"),
+           "log line: without a process name (-nostdin) there is nothing before the level");
+
+    Check ("1970-01-01T00:00:00Z  [Error] message: text\n" == FormatLogLine (0, "", "Error", "message", "text"),
+           "log line: an empty process name is the same as none");
+
+    Check ("1970-01-01T00:00:00Z  otelfwd: message: text\n" == FormatLogLine (0, "otelfwd", NULL, "message", "text"),
+           "log line: without a level");
+
+    Check ("1970-01-01T00:00:00Z  otelfwd: [Warning] message\n" == FormatLogLine (0, "otelfwd", "Warning", "message", NULL),
+           "log line: without a text after the message");
+
+    Check ("1970-01-01T00:00:00Z  otelfwd: [Warning] message\n" == FormatLogLine (0, "otelfwd", "Warning", "message", ""),
+           "log line: an empty text is the same as none, there is no dangling colon");
+
+    Check ("1970-01-01T00:00:00Z  message\n" == FormatLogLine (0, NULL, NULL, "message", NULL),
+           "log line: only a message: time, two blanks, message");
+
+    Check ("1970-01-01T00:00:00Z  \n" == FormatLogLine (0, NULL, NULL, NULL, NULL),
+           "log line: no message at all does not crash");
+}
+
+
+/* What goes to stderr really: the time is now, and the line is one piece */
+static void TestLogOutput ()
+{
+    time_t Before = time (NULL);
+
+    SetLogPrefix ("otelfwd");
+
+    std::string Out = CaptureStderr ([] { WriteLogLine ("Error", "test message", "test text"); });
+
+    time_t After = time (NULL);
+
+    Check (StartsWithTimestamp (Out), "log output: the line starts with a time stamp and two blanks");
+    Check (Out.size() > 22 && "otelfwd: [Error] test message: test text\n" == Out.substr (22), "log output: the process name, the level, the message and the text follow");
+
+    struct tm Tm {};
+    bool bParsed = (NULL != ::strptime (Out.c_str(), "%Y-%m-%dT%H:%M:%SZ", &Tm));
+    time_t Logged = bParsed ? ::timegm (&Tm) : 0;
+
+    Check (bParsed && (Logged >= Before - 1) && (Logged <= After + 1), "log output: the time is the time of now, in UTC");
+
+    SetLogPrefix (NULL);
+
+    Out = CaptureStderr ([] { WriteLogLine (NULL, "plain message"); });
+    Check (StartsWithTimestamp (Out) && Out.size() > 22 && "plain message\n" == Out.substr (22), "log output: without a process name (-nostdin) the message follows the time stamp");
+
+    Out = CaptureStderr ([] { errno = ENOENT; WriteLogErrno ("Cannot open the file"); });
+    Check (Out.size() > 22 && "[Error] Cannot open the file: No such file or directory\n" == Out.substr (22), "log output: an error with errno has the text of the error, in the place of perror");
+}
+
+
 int main ()
 {
     setvbuf (stdout, NULL, _IOLBF, 0);
 
-    Group ("Push test: failover and converter");
+    Group ("otelfwd unit test: failover, converter, log lines");
     printf ("Which endpoint gets a push request. P: primary, p: primary tried again (probe), B: backup\n");
 
     Group ("Without a backup, and with a working primary");
@@ -732,6 +895,11 @@ int main ()
 
     Group ("Converter: input which is refused");
     TestRefused();
+
+    Group ("Log lines: time stamp and format");
+    TestLogTime();
+    TestLogLine();
+    TestLogOutput();
 
     if (false == g_FailedNames.empty())
     {

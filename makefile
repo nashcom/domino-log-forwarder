@@ -4,36 +4,41 @@ LDFLAGS  = -lcurl
 
 # Targets
 TARGET  = otelfwd
-TARGET_TEST = wal_unit_test push_failover_test
+TARGET_TEST = otelfwd_unit_test
 
-# Common sources
-WAL_SRC  = simple_wal.cpp
-WAL_HDR  = simple_wal.hpp
+# The WAL is a module of its own, with its sample, its tests and its README: see wal/README.md
+WAL_DIR  = wal
+WAL_SRC  = $(WAL_DIR)/simple_wal.cpp
+WAL_HDR  = $(WAL_DIR)/simple_wal.hpp
+
 PUSH_HDR = push_status.hpp push_failover.hpp otlp_protobuf.hpp
 LOG_HDR  = log_line.hpp
 
 # Targets which are not files. Without this a file named "test" would make "make test" do nothing
-.PHONY: all test clean
+.PHONY: all test tsan wal_sample clean
 
 all: $(TARGET)
 
-# Builds and runs the unit tests: the WAL, and the push path (failover between two OTLP endpoints, JSON to protobuf converter).
-# All of them run, even if one fails
+# Builds and runs the unit tests: the WAL (in wal/, with its sample program), and the pieces of otelfwd (failover between two OTLP
+# endpoints, JSON to protobuf converter, log lines). Both run, even if one fails
 test: $(TARGET_TEST)
-	@fail=0; for t in $(TARGET_TEST); do ./$$t || fail=1; done; exit $$fail
+	@fail=0; $(MAKE) -C $(WAL_DIR) test || fail=1; for t in $(TARGET_TEST); do ./$$t || fail=1; done; exit $$fail
+
+# The WAL test with ThreadSanitizer, see wal/makefile. Not part of "make test": it needs g++ with the sanitizer library (libtsan)
+tsan:
+	$(MAKE) -C $(WAL_DIR) tsan
+
+# The sample program of the WAL, see wal/wal_sample.cpp:  make wal_sample && ./wal/wal_sample
+wal_sample:
+	$(MAKE) -C $(WAL_DIR) wal_sample
 
 otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(PUSH_HDR) $(LOG_HDR)
-	$(CXX) $(CXXFLAGS) -o $@ otelfwd.cpp $(WAL_SRC) $(LDFLAGS)
+	$(CXX) $(CXXFLAGS) -I$(WAL_DIR) -o $@ otelfwd.cpp $(WAL_SRC) $(LDFLAGS)
 
-# Unit test of the WAL module alone: no otelfwd, no network. Also measures the throughput of the WAL
-# --wrap lets the test make ftruncate and unlink fail on request (fault injection), without any test code in the WAL
-wal_unit_test: wal_unit_test.cpp $(WAL_SRC) $(WAL_HDR) $(LOG_HDR)
-	$(CXX) $(CXXFLAGS) -pthread -Wl,--wrap=ftruncate -Wl,--wrap=unlink -o $@ wal_unit_test.cpp $(WAL_SRC)
-
-# Unit test of the decisions in push_failover.hpp (which OTLP endpoint gets a request) and of the converter in
-# otlp_protobuf.hpp (JSON to protobuf). No network. Needs the rapidjson headers
-push_failover_test: push_failover_test.cpp push_failover.hpp push_status.hpp otlp_protobuf.hpp
-	$(CXX) $(CXXFLAGS) -pthread -o $@ push_failover_test.cpp
+# Unit test of the failover (push_failover.hpp), of the converter (otlp_protobuf.hpp) and of the log lines (log_line.hpp). No network
+# Needs the rapidjson headers
+otelfwd_unit_test: otelfwd_unit_test.cpp $(PUSH_HDR) $(LOG_HDR)
+	$(CXX) $(CXXFLAGS) -pthread -o $@ otelfwd_unit_test.cpp
 
 # Test tool: receiving end of the OTLP test container, see tools/otel-sink/. Not part of "all".
 #   make otel-sink                needs rapidjson and zlib headers
@@ -51,4 +56,5 @@ clean:
 	rm -f otel-sink
 	rm -f loadtest
 	rm -f *.o
+	$(MAKE) -C $(WAL_DIR) clean
 

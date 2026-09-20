@@ -2,8 +2,12 @@
 /otelfwd
 /otel-sink
 /loadtest
-/wal_unit_test
-/push_failover_test
+/otelfwd_unit_test
+
+# The WAL module: sample and tests
+/wal/wal_sample
+/wal/wal_unit_test
+/wal/wal_unit_test_tsan
 otel-received/
 otel-data/
 

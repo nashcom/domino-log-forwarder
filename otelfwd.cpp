@@ -3408,6 +3408,9 @@ int main (int argc, char *argv[])
 
     MakeDirectoryTreeFromFileName (g_szMetricsFileName);
 
+    /* The messages of the WAL ("[Error] WAL: ...") are lines of the console output of otelfwd: with the time and the process name */
+    g_Wal.SetLogFunction ([] (const char *pszMessage) { LogMessage (pszMessage); });
+
     if (*g_szOtlpPushApiURL)
         g_bWalOpened = g_Wal.Init (g_szWalFile);
 

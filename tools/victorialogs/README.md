@@ -28,7 +28,7 @@ VictoriaLogs  --->  web UI        http://localhost:9428/select/vmui/
 You need Docker. From the repository root:
 
 ```bash
-docker compose -f victorialogs/compose.yml up -d
+docker compose -f tools/victorialogs/compose.yml up -d
 ```
 
 Send the sample Domino console lines with `otelfwd`. **`OTLP_PUSH_ENCODING=protobuf` is required**:
@@ -58,7 +58,7 @@ curl -s http://localhost:9428/select/logsql/query -d 'query=_time:10m | limit 5'
 Stop VictoriaLogs. The logs stay in the Docker volume:
 
 ```bash
-docker compose -f victorialogs/compose.yml down
+docker compose -f tools/victorialogs/compose.yml down
 ```
 
 ## Standalone mode
@@ -97,7 +97,7 @@ Good to know:
 ## What VictoriaLogs gets
 
 Every log line is one OTLP log record. `otelfwd` sends the resource attributes (`service.name`, `service.namespace`, `service.instance.id`, `host.name`, `os.type`), the scope (name and version), and per record the time, the severity if there is one, the line as the body, and attributes such as `domino.task` and `process.pid`.
-The complete list is in the [main README](../README.md).
+The complete list is in the [main README](../../README.md).
 
 VictoriaLogs treats the resource attributes as the fields which identify a log stream ("stream fields", see the [OpenTelemetry page](https://docs.victoriametrics.com/victorialogs/data-ingestion/opentelemetry/) of the documentation).
 The other names it creates are best seen on your own data: the query below shows the records as JSON, and the web UI has a JSON view too.
@@ -142,7 +142,7 @@ Endpoints on port `9428`:
 `down` keeps the volume. To start with an empty database, remove the volume as well:
 
 ```bash
-docker compose -f victorialogs/compose.yml down -v
+docker compose -f tools/victorialogs/compose.yml down -v
 ```
 
 ## Notes
@@ -157,5 +157,5 @@ docker compose -f victorialogs/compose.yml down -v
 * [VictoriaLogs documentation](https://docs.victoriametrics.com/victorialogs/)
 * [OpenTelemetry setup for VictoriaLogs](https://docs.victoriametrics.com/victorialogs/data-ingestion/opentelemetry/)
 * [Querying VictoriaLogs](https://docs.victoriametrics.com/victorialogs/querying/) and [LogsQL](https://docs.victoriametrics.com/victorialogs/logsql/)
-* [otelfwd README](../README.md)
+* [otelfwd README](../../README.md)
 

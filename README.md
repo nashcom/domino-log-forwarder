@@ -4,12 +4,14 @@ Forwards the logs and events of an [HCL Domino](https://www.hcl-software.com/dom
 
 The repository has two programs which work together, and some tools to test them:
 
-| Component                                       | What it is                                                                                                                              |
-| :---------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------- |
-| [`otelfwd`](#otelfwd---the-otel-forwarder)      | The forwarder. Reads the **Domino console log** from STDIN (`server \| otelfwd`) and structured records from local sockets, pushes OTLP |
-| [`domfwd`](domfwd/README.md)                    | Domino server add-in. Reads the **Domino events** (Event Monitoring queue) and sends one structured record per event to `otelfwd`       |
-| [`nginx/`](nginx/README.md)                     | Test NGINX container which logs via syslog into `otelfwd`, and the end to end load test                                                 |
-| [`tools/otel-sink/`](tools/otel-sink/README.md) | Test OTLP receiver container                                                                                                            |
+| Component                                             | What it is                                                                                                                              |
+| :---------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------- |
+| [`otelfwd`](#otelfwd---the-otel-forwarder)            | The forwarder. Reads the **Domino console log** from STDIN (`server \| otelfwd`) and structured records from local sockets, pushes OTLP |
+| [`domfwd`](domfwd/README.md)                          | Domino server add-in. Reads the **Domino events** (Event Monitoring queue) and sends one structured record per event to `otelfwd`       |
+| [`nginx/`](nginx/README.md)                           | Test NGINX container which logs via syslog into `otelfwd`, and the end to end load test                                                 |
+| [`tools/victorialogs/`](tools/victorialogs/README.md) | VictoriaLogs container: a real log database to try `otelfwd` with. It needs `OTLP_PUSH_ENCODING=protobuf`                               |
+| [`wal/`](wal/README.md)                               | The write ahead log of `otelfwd` as a module of its own: usable by other programs, with a sample program and its tests                  |
+| [`tools/otel-sink/`](tools/otel-sink/README.md)       | Test OTLP receiver container                                                                                                            |
 
 `otelfwd` is general purpose. Everything which can write a line of text or a JSON record to a local socket can use it, for example NGINX. The Domino specific parts are the console log annotation and `domfwd`.
 
@@ -347,6 +349,10 @@ The WAL file is `otelfwd.wal` in the data directory (`OTELFWD_DATA_DIR`).
 
 The OTLP specification retries only 429, 502, 503 and 504, and says that all other 4xx and 5xx codes must not be retried. `otelfwd` is more careful with the data. A wrong token (401), a wrong URL (404) or a size limit of the receiver (413) is a problem of the configuration which is fixed later, and dropping the logs meanwhile would lose them. Only a 400, the receiver saying that the data itself is bad, fails completely.
 
+#### The WAL as a module
+
+The WAL is a module of its own in [`wal/`](wal/README.md): the class `SimpleWAL` with a sample program, its tests and its README. It can be used by other programs. The interface, the rules, the files and the tests are described there. `otelfwd` sets a function which writes the messages of the WAL as lines of its console output, with the time (see [Log at start](#log-at-start)).
+
 ## Output in OTLP/HTTP JSON format
 
 One request contains one `resourceLogs` entry per resource and scope, and one log record per log line in arrival order.
@@ -487,128 +493,35 @@ Both scripts print how many lines were pushed and return an error if the push fa
 
 ## Testing
 
-| Test                        | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                              |
-| :-------------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| WAL unit test               | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, speed. And the format of the log lines: time stamp, prefix, level                                                  |
-| Failover and converter test | `make test`                                                                                      | a C++ compiler and `make` | Which OTLP endpoint gets a request: the backup, the failback timing, refused data, threads. And the converter from JSON to protobuf ([details](#unit-test-of-the-failover)) |
-| Load test                   | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                   |
-| Load test with an outage    | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                    | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end))  |
+| Test                     | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                                                    |
+| :----------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| WAL unit test            | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, use from several threads, one record at a time (Peek and Ack), the size limit, its messages, speed ([details](wal/README.md#the-tests))  |
+| Unit test of otelfwd     | `make test`                                                                                      | a C++ compiler and `make` | The failover between two OTLP endpoints (backup, failback timing, refused data, threads), the converter from JSON to protobuf, and the format of the log lines ([details](#unit-test-of-otelfwd)) |
+| Load test                | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                                         |
+| Load test with an outage | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                    | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end))                        |
 
 `--yes` in the commands of `run_loadtest.sh` means: do not ask for the size of the test. Without it, the script asks in a terminal for the number of threads and requests, and Enter takes the default (8 threads with 10,000 requests each). `./nginx/run_loadtest.sh --help` lists all options of the script and of the load test program.
 
-### Unit test of the WAL
+### Unit test of otelfwd
 
-`wal_unit_test.cpp` is a separate program which only links the WAL (`simple_wal.cpp`). It needs no `otelfwd`, no libcurl, no Docker and no network. It works in a directory of its own, which it removes at the end, and takes a few seconds.
-
-```bash
-make test
-```
-
-`make test` compiles the tests when a source changed, and runs them: this one and the [failover and converter test](#unit-test-of-the-failover). All of them run even if one fails, and `make` ends with an error if a check failed. This test can also be started directly:
+`otelfwd_unit_test.cpp` tests the pieces of `otelfwd` which need no network and no other program: the failover between two endpoints, the converter from JSON to protobuf, and the format of the log lines. `make test` builds and runs it, or directly:
 
 ```bash
-./wal_unit_test
+./otelfwd_unit_test
 ```
 
-| Option      | Description                                                                                                                                                                                     |
-| :---------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `-n COUNT`  | Number of records of the producer and consumer test and of the performance table. Default: 100000                                                                                               |
-| `DIRECTORY` | The parent directory of the test files. Default: `/tmp`, which can be a RAM file system. The test makes a directory of its own in it and removes it. See [Performance](#performance-of-the-wal) |
+**The failover** (`push_failover.hpp`): which endpoint gets a push request. There is no network. The failover object does not send anything: the test gives it a function which answers what the test says (delivered, not delivered, or refused) and writes down which endpoint was called (`P` primary, `p` primary tried again while the backup is in use, `B` backup). Time is a parameter, so the 60 seconds of the failback need no waiting.
 
-```bash
-./wal_unit_test -n 1000000
-```
+It checks: no backup, a working primary, the failover and that the backup stays in use, both endpoints failing, refused data (not sent to the other endpoint), the failback at exactly the configured time (not a second before), the immediate try of the primary when the backup fails, the statistics, and threads: when the probe of the primary is due and 8 threads send at the same second, exactly one of them makes it. The output has sections and `[PASS]` / `[FAIL]` lines like the WAL test, see [Reading the output](wal/README.md#reading-the-output).
 
-**Files of the WAL:** `otelfwd.wal` holds the push requests which could not be delivered. `otelfwd.wal.commit` holds the position of the first record which is not replayed yet. `otelfwd.wal.corrupt` receives data which cannot be read (a record cut off by a crash, or a damaged length). Records are delivered at least once: after a crash a record can be delivered again, but none is lost.
-
-#### Reading the output
-
-The output has headed sections. Every check is one line with its status:
-
-```text
---------------------------------------------------------------------------------
-Behaviour
---------------------------------------------------------------------------------
-
-[PASS]  round trip: init
-[PASS]  round trip: a new WAL has nothing pending
-...
---------------------------------------------------------------------------------
-Result
---------------------------------------------------------------------------------
-
-[PASS]  166 of 166 checks passed, 0 failed
-```
-
-* `[PASS]` and `[FAIL]` mark every check. If something failed, a section **Failed checks** lists only those lines, before the section **Result**.
-* The last section, **Result**, is `[PASS]` only if every check passed. The exit code of the program is 0 then, and 1 otherwise.
-* The WAL writes warnings and errors to stderr, and some tests cause them on purpose, for example `[Error] WAL: unreadable data at offset ... moved to ....corrupt` or `[Error] Cannot write to WAL: File too large`. They are not failures. Only a `[FAIL]` line is.
-
-#### What it tests
-
-| Section                | Names of the checks start with                           | What it covers                                                                                                                                                                                                                                                                                                                                                                      |
-| :--------------------- | :------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Log lines              | `log time:`, `log line:`, `log output:`, `WAL log line:` | The console output of `otelfwd` (`log_line.hpp`), which the WAL uses for its messages too. The time is UTC in ISO 8601 (exact values from `date`, also when the host time zone is 12 hours ahead), then two blanks, the process name, the level, the message and a text. The line is written to stderr, and the messages of the WAL have it                                         |
-| Behaviour              | the name of the test                                     | Order of the records, partial replay and resuming it, no progress, empty records and a WAL which was not opened, restart, the destructor, `Clear()`, a 5 MB record, 10,000 records, four threads appending at once, one thread appending while another replays                                                                                                                      |
-| Findings of the review | `[finding N]`                                            | Problems which a code review found. A replay must not get stuck at a commit position at or behind the end of the WAL, a record which was cut off by a crash, a damaged length or a partial header. A failed append leaves nothing behind. Files are only accessible for their owner, also old ones. A new WAL is silent. A commit file which is short, empty or too long is ignored |
-| Second review          | `[review 2]`                                             | A commit position inside a record is not used: the WAL is replayed from the start. Failures while saving: the commit position cannot be written, the WAL cannot be truncated, the commit file cannot be removed, the unreadable part cannot be moved. A zero length is damage, not the end. The repaired state survives a restart. The sync option. Real crashes                    |
-| Performance            | `performance:`                                           | Speed of appending, replaying and starting with a backlog, with a table and very low limits ([below](#performance-of-the-wal))                                                                                                                                                                                                                                                      |
-
-The tests for failures use these techniques. None of them needs code for tests in the WAL:
-
-* **A full disk** is simulated with the size limit of a file (`setrlimit`), which also works as root.
-* **A directory with the name of the file** makes it impossible to create the `.corrupt` file.
-* **Fault injection:** the makefile links the test with `-Wl,--wrap=ftruncate -Wl,--wrap=unlink`. The test then makes these two functions fail on request, and the calls of the WAL go through them. If the test is compiled by hand without these options, the checks for a failing `ftruncate` or `unlink` fail, because the failure is never injected.
-* **Crashes are real:** a child process (`fork`) ends with `_exit()`, which runs no destructor. In one test it ends after appending, and the parent must find the records. In another it ends inside the replay, after a record was delivered and before the position was saved. The parent must get all records again.
-
-#### Performance of the WAL
-
-The last section prints a table:
-
-```text
-File system: tmpfs (memory, not a disk: fsync does nothing, speeds are much higher than on a disk)
-
-Measurement                                            Records  Time (ms)    Records/s      MB/s
-append, 100 byte records, one thread                    100000       61.5      1625380     169.0
-replay everything, 100 byte records                     100000       43.5      2301332     239.3
-append, 64 KB records (a push request)                    1000       13.1        76113    4988.5
-replay everything, 64 KB records                          1000       14.3        69830    4576.6
-start with a backlog: check of the commit position       50000       10.2      4888202     508.4
-append with fsync, 100 byte records (no limit)            2000        1.3      1518900     158.0
-```
-
-* **The file system decides.** The line above the table names it. On a RAM file system (`tmpfs`) `fsync` does nothing and everything is much faster than on a disk. `/tmp` can be one. To measure the disk where the WAL of `otelfwd` lives, give its directory. The test makes its own subdirectory in it and removes it:
-
-```bash
-./wal_unit_test /local/notesdata
-```
-
-* **The numbers depend on the machine and its load.** They are for comparing two versions of the WAL on the same machine and the same file system, not absolute values. Run it a few times, and not while another test runs.
-* **Start with a backlog** is the check which `Replay` does once when a program starts: it follows the records up to the commit position to make sure that it is the start of a record. The time grows with the number of records before the position.
-* **The checks have very low limits** on purpose (20,000 records/s for small records, 200 records/s for 64 KB records, 50,000 records/s for the check at start). They only fail when something is dramatically wrong. The `fsync` row has no limit, because it depends on the disk.
-
-#### Adding a test
-
-Write a function in `wal_unit_test.cpp` and call it from `main` in the fitting section. Use `Check (condition, "name")`, one call for every statement which must be true. The name is what appears in the output, so it should say what is expected. Look at the files on disk (`FileSize`, `FileExists`, `FileMode`) and do not trust the WAL to report about itself. For a bug, write the test first and see it fail, then fix the WAL and see it pass.
-
-The former program `wal_test` (a speed test without checks) is part of this test now: the producer and consumer test checks that every record arrives once and in order, and the performance section prints the speed.
-
-### Unit test of the failover
-
-`push_failover_test.cpp` tests the decisions of `push_failover.hpp`: which endpoint gets a push request. There is no network. The failover object does not send anything: the test gives it a function which answers what the test says (delivered, not delivered, or refused) and writes down which endpoint was called (`P` primary, `p` primary tried again while the backup is in use, `B` backup). Time is a parameter, so the 60 seconds of the failback need no waiting.
-
-```bash
-./push_failover_test
-```
-
-It checks: no backup, a working primary, the failover and that the backup stays in use, both endpoints failing, refused data (not sent to the other endpoint), the failback at exactly the configured time (not a second before), the immediate try of the primary when the backup fails, the statistics, and threads: when the probe of the primary is due and 8 threads send at the same second, exactly one of them makes it. The output has the same sections and `[PASS]` / `[FAIL]` lines as the WAL test.
-
-The same program tests the converter from JSON to protobuf (`otlp_protobuf.hpp`, used with `OTLP_PUSH_ENCODING=protobuf`). The expected bytes were worked out by hand from the OTLP protobuf definition and are written in hex in the test, with the structure in the spaces. It checks:
+**The converter** from JSON to protobuf (`otlp_protobuf.hpp`, used with `OTLP_PUSH_ENCODING=protobuf`). The expected bytes were worked out by hand from the OTLP protobuf definition and are written in hex in the test, with the structure in the spaces. It checks:
 
 * A record with all fields and all four types of values, the largest and the smallest int64, times as a string and as a number (also above the largest int64), a bool which is false, and members of the JSON in another order.
 * Text: non-ASCII characters, an empty string, a zero byte inside a string, and lengths above 127, which are written as two byte varints on every level.
 * The order of records and of `resourceLogs`, empty input, and that only the given length of the input is read.
 * What must be refused: broken JSON, more than one JSON value, a member or a type of value which the converter does not know, a value with two types, wrong types, and numbers which are out of range. An error returns no bytes, and the error text names the member.
+
+**The log lines** (`log_line.hpp`): the console output of `otelfwd`. The time is UTC in ISO 8601, then two blanks, the process name (in pipe mode), the level, the message and a text. The expected times are what the `date` command says for the same number of seconds, also when the host time zone is 12 hours ahead. The lines are written to stderr in one piece, and without a process name with `-nostdin`.
 
 ### Test receiver and load test
 
