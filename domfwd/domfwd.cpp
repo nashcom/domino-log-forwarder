@@ -1156,9 +1156,11 @@ void BuildEventPayload (const DOMFWD_OTEL_FIELDS *pFields, rapidjson::StringBuff
     doc.AddMember ("severity_text",           rapidjson::Value (pFields->pszSeverityText, alloc), alloc);
     doc.AddMember ("body",                    rapidjson::Value (pFields->pszBody, alloc), alloc);
 
-    /* scope: identifies the emitting instrumentation, per the OTel Log Data Model */
+    /* scope: identifies the emitting instrumentation, per the OTel Log Data Model. The version is the one of this add-in: the version of
+       the Domino server is the resource attribute service.version */
     rapidjson::Value scope (rapidjson::kObjectType);
-    scope.AddMember ("name", rapidjson::Value (g_szScope, alloc), alloc);
+    scope.AddMember ("name",    rapidjson::Value (g_szScope, alloc), alloc);
+    scope.AddMember ("version", rapidjson::Value (DOMFWD_VERSION, alloc), alloc);
     doc.AddMember ("scope", scope, alloc);
 
     /* resource/attributes: field list built once in BuildOtelFields */
@@ -1264,9 +1266,10 @@ void PushEventToOtel (const DOMFWD_OTEL_FIELDS *pFields, const rapidjson::String
     rapidjson::Value resource (rapidjson::kObjectType);
     resource.AddMember ("attributes", resourceAttrs, alloc);
 
-    /* ---- scope ---- */
+    /* ---- scope: the same as in the record of the socket path (BuildEventPayload), so both paths look alike ---- */
     rapidjson::Value scope (rapidjson::kObjectType);
-    scope.AddMember ("name", rapidjson::Value (g_szTask, alloc), alloc);
+    scope.AddMember ("name",    rapidjson::Value (g_szScope, alloc), alloc);
+    scope.AddMember ("version", rapidjson::Value (DOMFWD_VERSION, alloc), alloc);
 
     /* ---- logRecord: body is the already-built payload buffer, verbatim ---- */
     rapidjson::Value logRecord (rapidjson::kObjectType);

@@ -112,6 +112,8 @@
 #include "otlp_protobuf.hpp"
 #include "log_line.hpp"
 #include "health.hpp"
+#include "file_input.hpp"
+#include "file_reader.hpp"
 
 /* pid.nbf map definition */
 using PidMap = std::unordered_map<pid_t, std::string>;
@@ -120,6 +122,11 @@ using PidMap = std::unordered_map<pid_t, std::string>;
    The push thread never waits to fill a batch: it takes whatever is queued up to these limits. */
 #define OTELFWD_MAX_BATCH_RECORDS 100
 #define OTELFWD_MAX_BATCH_BYTES   (512 * 1024)
+
+/* The file input: how often it looks for new lines when there are none, and how many lines it reads before it looks at what the
+   push thread delivered */
+#define OTELFWD_FILE_POLL_MS             200
+#define OTELFWD_FILE_LINES_PER_ROUND     1000
 
 /* Limits for the socket inputs */
 #define OTELFWD_MAX_LINE_BYTES           (1024 * 1024)
@@ -148,7 +155,8 @@ struct OtelKV
 enum LogSource
 {
     LOG_SOURCE_STDIN = 0,
-    LOG_SOURCE_SOCKET
+    LOG_SOURCE_SOCKET,
+    LOG_SOURCE_FILE
 };
 
 /* One log line moving through the forwarder.
@@ -157,7 +165,10 @@ enum LogSource
                 The push thread sets Pid, Process and Attributes (annotation via pid.nbf).
 
    Records from socket inputs are decoded from the flat record format and use all fields.
-   Empty/zero fields select the forwarder's defaults in the OTLP payload. */
+   Empty/zero fields select the forwarder's defaults in the OTLP payload.
+
+   Records of the file input have the line as the body and the attribute log.file.path. FileGeneration and FileEndOffset say where in
+   the file the line ends: when the push thread is done with the batch, the position is committed (see FileCommitSlot). */
 struct LogRecord
 {
     LogSource   Source         = LOG_SOURCE_STDIN;
@@ -172,6 +183,8 @@ struct LogRecord
     std::string ScopeVersion;
     std::vector<OtelKV> Resource;       /* empty: forwarder default resource */
     std::vector<OtelKV> Attributes;
+    uint64_t    FileGeneration = 0;     /* file input only: 0 for every other record */
+    uint64_t    FileEndOffset  = 0;
 };
 
 /* FIFO class used to hand log records from the ingestion threads to the push thread */
@@ -241,6 +254,13 @@ public:
         return true;
     }
 
+    /* The number of queued records. The file input reads only while the queue has room */
+    size_t size()
+    {
+        std::lock_guard<std::mutex> lock (m_mutex);
+        return m_queue.size();
+    }
+
     void shutdown()
     {
         {
@@ -293,6 +313,11 @@ char g_szEnvUnixSocketMode[]         = "OTELFWD_UNIX_SOCKET_MODE";
 char g_szEnvSyslogSocket[]           = "OTELFWD_SYSLOG_SOCKET";
 char g_szEnvSyslogSocketMode[]       = "OTELFWD_SYSLOG_SOCKET_MODE";
 char g_szEnvTcpListen[]              = "OTELFWD_TCP_LISTEN";
+char g_szEnvFileInput[]              = "OTELFWD_FILE_INPUT";
+char g_szEnvFileStart[]              = "OTELFWD_FILE_START";
+char g_szEnvFileStateDir[]           = "OTELFWD_FILE_STATE_DIR";
+char g_szEnvFileSeverity[]           = "OTELFWD_FILE_SEVERITY";
+char g_szEnvFileService[]            = "OTELFWD_FILE_SERVICE";
 char g_szEnvSocketQueueMax[]         = "OTELFWD_SOCKET_QUEUE_MAX";
 char g_szEnvOtlpPushApiUrl[]         = "OTLP_PUSH_API_URL";
 char g_szEnvOtlpPushApiUrlBackup[]   = "OTLP_PUSH_API_URL_BACKUP";
@@ -325,6 +350,17 @@ char g_szUnixSocketPath[1100]    = {0};   /* data dir (1024) plus the default pa
 char g_szSyslogSocketPath[1024]  = {0};
 char g_szTcpListen[256]          = {0};
 
+/* The file input (OTELFWD_FILE_INPUT): one file. Its path is absolute. The state file is next to it (<file>.otelfwd-state), or in the
+   state directory if there is one (OTELFWD_FILE_STATE_DIR: g_szFileStateDir is empty without it) */
+char g_szFileInput[2048]         = {0};
+char g_szFileStateDir[1024]      = {0};
+char g_szFileStateFile[3200]     = {0};
+bool g_bFileStartAtEnd           = false;       /* OTELFWD_FILE_START: without a state file the file is read from its end, not from its beginning */
+int  g_FileSeverityNumber        = 9;           /* OTELFWD_FILE_SEVERITY: the severity of every line. info by default, 0 is none */
+char g_szFileSeverityText[16]    = "INFO";
+char g_szFileService[256]        = {0};         /* OTELFWD_FILE_SERVICE: service.name and service.namespace of the lines. Empty: the defaults of the forwarder */
+bool g_bFileInputEnabled         = false;       /* the file input is configured and works: it is only set at start */
+
 char g_szDataDir[1024]      = "/local/notesdata";
 char g_szOtlpServiceName[1024]   = "domino";
 char g_szServiceNamespace[1024]  = "domino";
@@ -352,6 +388,7 @@ std::atomic<size_t> g_ReloadRequested      {0};
 std::atomic<size_t> g_PushThreadRunning    {0};
 std::atomic<size_t> g_WalThreadRunning     {0};
 std::atomic<size_t> g_MetricsThreadRunning {0};
+std::atomic<size_t> g_FileThreadRunning    {0};
 
 /* Options to enable functionality. Set once at startup, before any thread is created */
 size_t g_LogLevel              = 0;
@@ -367,6 +404,7 @@ mode_t g_SyslogSocketMode      = 0600;
 pthread_t g_WalThreadInstance     = {0};
 pthread_t g_PushThreadInstance    = {0};
 pthread_t g_MetricsThreadInstance = {0};
+pthread_t g_FileThreadInstance    = {0};
 
 /* Process start time */
 time_t g_tStartTime = time (NULL);
@@ -388,6 +426,11 @@ bool g_bWalOpened = false;      /* the result of opening it. Only used for the s
 /* The health state for alerting (see health.hpp). Only the metrics thread updates it */
 HealthMonitor g_Health;
 
+/* The file input. g_FileReader belongs to the file thread, and to main before it starts and after it ended: it is not thread safe.
+   The push thread does not touch it. It leaves the position of the lines which it delivered in g_FileCommit */
+FileReader     g_FileReader;
+FileCommitSlot g_FileCommit;
+
 /* Which OTLP endpoint gets a push request: the primary, or the backup while the primary fails. Used by the push thread
    and by the thread which replays the WAL */
 PushFailover g_PushFailover;
@@ -404,6 +447,10 @@ std::atomic<std::int64_t> g_Metric_PushErrors       {0};
 std::atomic<std::int64_t> g_Metric_PushRetrySuccess {0};
 std::atomic<std::int64_t> g_Metric_PushRetryErrors  {0};
 std::atomic<std::int64_t> g_Metric_PushRejected     {0};   /* push requests which are dropped for good: the receiver refused them as bad data (HTTP 400), or they cannot be converted to protobuf */
+std::atomic<std::int64_t> g_Metric_FileLines        {0};   /* lines read from the file input and queued */
+std::atomic<std::int64_t> g_Metric_FileTruncated    {0};   /* the part of them which were longer than the maximum and were cut */
+std::atomic<std::int64_t> g_Metric_FileCommitted    {0};   /* the position in the file up to which the lines were delivered. Written by the file thread */
+std::atomic<std::int64_t> g_Metric_FileOpen         {0};   /* 1 if the file is open: 0 if it does not exist (yet) */
 std::atomic<std::int64_t> g_Metric_WalRefused       {0};   /* push requests which the WAL did not take (it was full, or a failure). They are lost */
 std::atomic<std::int64_t> g_Metric_PushConvertErrors {0};  /* the part of them which could not be converted to protobuf (only with OTLP_PUSH_ENCODING=protobuf) */
 
@@ -1334,6 +1381,38 @@ static bool ParsePushEncoding (const char *pszValue, bool& retProtobuf)
 }
 
 
+/* The value of OTELFWD_FILE_START: begin or end, in any case. Returns false for any other text */
+static bool ParseFileStart (const char *pszValue, bool& retAtEnd)
+{
+    if (0 == strcasecmp (pszValue, "begin"))
+    {
+        retAtEnd = false;
+        return true;
+    }
+
+    if (0 == strcasecmp (pszValue, "end"))
+    {
+        retAtEnd = true;
+        return true;
+    }
+
+    return false;
+}
+
+
+/* The path as an absolute path: the same text every time, because the name of the state file is made from it. A relative path is
+   relative to the directory the program was started in */
+static void MakeAbsolutePath (const char *pszPath, char *pszOut, size_t OutSize)
+{
+    char szDirectory[1024] = {0};
+
+    if ( ('/' == *pszPath) || (NULL == getcwd (szDirectory, sizeof (szDirectory))) )
+        snprintf (pszOut, OutSize, "%s", pszPath);
+    else
+        snprintf (pszOut, OutSize, "%s/%s", szDirectory, pszPath);
+}
+
+
 /* A number of seconds from 1 to MaxValue, and nothing else after the number. Returns false for any other text */
 static bool ParseSecondsSetting (const char *pszValue, long MaxValue, size_t& retSeconds)
 {
@@ -1525,6 +1604,18 @@ PushAction SendPushRequest (CURL* pCurl, const char* pszBuffer, size_t BufferLen
 }
 
 
+/* The push thread is done with a batch, and its records are safe: they were accepted, or kept in the WAL, or refused for good.
+   Tells the file thread how far the lines of the file input were delivered. It commits, this thread does not touch the reader */
+static void HandOverFilePositions (const std::vector<LogRecord>& Batch)
+{
+    for (const LogRecord& Record : Batch)
+    {
+        if (LOG_SOURCE_FILE == Record.Source)
+            g_FileCommit.Add (Record.FileGeneration, Record.FileEndOffset);
+    }
+}
+
+
 void *PushThread (void *arg)
 {
     (void)arg;
@@ -1556,6 +1647,11 @@ void *PushThread (void *arg)
 
             OtlpBatch.clear();
 
+            /* False if a record could neither be pushed nor kept in the WAL: the position of the file is not moved for this batch.
+               That only helps if the program restarts before a later batch is delivered: a later batch moves the position past
+               these lines, and they are lost (the WAL was full: see the health) */
+            bool bBatchSafe = true;
+
             /* Annotate the stdin records of the batch and collect the records to push */
             for (LogRecord& Record : Batch)
             {
@@ -1573,7 +1669,9 @@ void *PushThread (void *arg)
                     if (Record.Line.find ("WAL-TESTING") != std::string::npos)
                     {
                         LogMessage ("WAL-TESTING string received");
-                        SendPayloadToWAL (BuildOtlpPayload (std::vector<const LogRecord*> (1, &Record)));
+
+                        if (false == SendPayloadToWAL (BuildOtlpPayload (std::vector<const LogRecord*> (1, &Record))))
+                            bBatchSafe = false;
                     }
                     else
                     {
@@ -1602,10 +1700,14 @@ void *PushThread (void *arg)
                 else
                 {
                     g_Metric_PushErrors.fetch_add (BatchSize, std::memory_order_relaxed);
-                    SendPayloadToWAL (jOtlpPayload);
+
+                    if (false == SendPayloadToWAL (jOtlpPayload))
+                        bBatchSafe = false;
                 }
             }
 
+            if (bBatchSafe)
+                HandOverFilePositions (Batch);
         }
     }
 
@@ -1929,6 +2031,126 @@ void *IngestThread (void *arg)
         snprintf (szMessage, sizeof (szMessage), "%s input thread ended", pSource->pszTitle);
         LogMessage (szMessage);
     }
+
+    return NULL;
+}
+
+
+/* ---- File input ----
+   One file (OTELFWD_FILE_INPUT) is followed like tail -F, and every line is a log record: the line is the body, the time is the time
+   it was read, and the attribute log.file.path is the file. The reading is done by the FileReader (filereader/README.md): only complete
+   lines, rotation and truncation are handled, and the position is saved in a state file, so that a restart continues where it stopped.
+
+   The position is not saved when a line is read, but when it was delivered. The record carries the end of its line in the file. The
+   push thread hands the position of a finished batch over in g_FileCommit (FileCommitSlot), and this thread commits it. A crash or a restart
+   repeats the lines which were read and not delivered: at least once, like the WAL.
+
+   The thread reads only while the queue has room (OTELFWD_SOCKET_QUEUE_MAX). When the receiver is slow the queue fills up, and the file
+   waits: nothing is dropped, the file is the buffer. Empty lines are not sent. */
+
+/* Commits what the push thread delivered. The state file may not be writable: then the position is tried again in the next round.
+   bRetry, Generation and EndOffset are the position which was not committed yet, kept by the caller between the rounds */
+static void CommitDeliveredFilePositions (bool& bRetry, uint64_t& Generation, uint64_t& EndOffset)
+{
+    if (g_FileCommit.Take (Generation, EndOffset))
+        bRetry = true;
+
+    if ( bRetry && g_FileReader.Commit (Generation, EndOffset) )
+    {
+        bRetry = false;
+        g_Metric_FileCommitted.store (static_cast<std::int64_t> (g_FileReader.GetCommitted()), std::memory_order_relaxed);
+    }
+}
+
+
+/* The resource of the records of the file input: the default resource of the forwarder, with the service which OTELFWD_FILE_SERVICE
+   sets, as the name and as the namespace (like the syslog input does with its tag). Empty without the setting: the records then use
+   the default resource */
+static std::vector<OtelKV> GetFileResource()
+{
+    std::vector<OtelKV> Resource;
+
+    if (IsNullStr (g_szFileService))
+        return Resource;
+
+    Resource = GetDefaultResource();
+
+    for (OtelKV& KV : Resource)
+    {
+        if ( ("service.name" == KV.Key) || ("service.namespace" == KV.Key) )
+            KV.StrValue = g_szFileService;
+    }
+
+    return Resource;
+}
+
+
+void *FileThread (void *arg)
+{
+    (void)arg;
+
+    FileReader::Line    Line;
+    uint64_t            Generation = 0;
+    uint64_t            EndOffset  = 0;
+    bool                bRetry     = false;
+    OtelKV              PathAttribute = MakeStringKV ("log.file.path", g_szFileInput);
+    std::vector<OtelKV> Resource   = GetFileResource();
+    sigset_t            SigSet;
+
+    /* Signals are handled by the main thread */
+    sigemptyset (&SigSet);
+    sigaddset (&SigSet, SIGINT);
+    sigaddset (&SigSet, SIGTERM);
+    sigaddset (&SigSet, SIGHUP);
+    pthread_sigmask (SIG_BLOCK, &SigSet, NULL);
+
+    if (g_LogLevel)
+        LogMessage ("File input thread started");
+
+    while (0 == g_ShutdownRequested)
+    {
+        size_t Lines = 0;
+
+        CommitDeliveredFilePositions (bRetry, Generation, EndOffset);
+
+        /* The room is looked at before a line is read: a line which was read has to go into the queue */
+        while ( (Lines < OTELFWD_FILE_LINES_PER_ROUND) && (g_LogFifo.size() < g_SocketQueueMax) && g_FileReader.ReadLine (Line, time (NULL)) )
+        {
+            Lines++;
+
+            if (Line.bTruncated)
+                g_Metric_FileTruncated.fetch_add (1, std::memory_order_relaxed);
+
+            /* An empty line says nothing. Its position is covered by the next line which is delivered */
+            if (Line.Text.empty())
+                continue;
+
+            LogRecord Record;
+
+            Record.Source         = LOG_SOURCE_FILE;
+            Record.TimeNs         = GetEpochNanoseconds();
+            Record.Line           = std::move (Line.Text);
+            Record.SeverityNumber = g_FileSeverityNumber;
+            Record.SeverityText   = g_szFileSeverityText;
+            Record.Resource       = Resource;
+            Record.FileGeneration = Line.Generation;
+            Record.FileEndOffset  = Line.EndOffset;
+            Record.Attributes.push_back (PathAttribute);
+
+            g_LogFifo.push (std::move (Record));
+            g_Metric_FileLines.fetch_add (1, std::memory_order_relaxed);
+        }
+
+        g_Metric_FileOpen.store (g_FileReader.IsFileOpen() ? 1 : 0, std::memory_order_relaxed);
+
+        if (0 == Lines)
+            sleep_ms (OTELFWD_FILE_POLL_MS);
+    }
+
+    g_FileThreadRunning = 0;
+
+    if (g_LogLevel)
+        LogMessage ("File input thread ended");
 
     return NULL;
 }
@@ -2664,6 +2886,15 @@ bool WriteMetrics (bool bShutdown = false)
 
     WriteStatsEntryToFileWithHelp (fp, g_Metric_PushRejected.load (std::memory_order_relaxed), "push_rejected_total", g_szPromTypeCounter, "Total number of push requests which are dropped for good, not kept in the WAL: the receiver refused them as bad data (HTTP 400), or they could not be converted to protobuf");
 
+    /* Only with a file input */
+    if (g_bFileInputEnabled)
+    {
+        WriteStatsEntryToFileWithHelp (fp, static_cast<uint64_t> (g_Metric_FileLines.load (std::memory_order_relaxed)), "file_lines_total", g_szPromTypeCounter, "Total number of lines read from the file input and queued (empty lines are skipped)");
+        WriteStatsEntryToFileWithHelp (fp, static_cast<uint64_t> (g_Metric_FileTruncated.load (std::memory_order_relaxed)), "file_lines_truncated_total", g_szPromTypeCounter, "Total number of lines of the file input which were longer than 1 MB and were cut");
+        WriteStatsEntryToFileWithHelp (fp, static_cast<uint64_t> (g_Metric_FileCommitted.load (std::memory_order_relaxed)), "file_committed_offset_bytes", g_szPromTypeGauge, "Position in the file up to which the lines were delivered (accepted, or kept in the WAL). It starts again at 0 when the file is rotated or truncated");
+        WriteStatsEntryToFileWithHelp (fp, static_cast<uint64_t> (g_Metric_FileOpen.load (std::memory_order_relaxed)), "file_open", g_szPromTypeGauge, "1 if the file of the file input is open, 0 if it does not exist");
+    }
+
     /* Only with a push target, which is where a WAL is used */
     if (false == IsNullStr (g_szOtlpPushApiURL))
     {
@@ -2811,6 +3042,22 @@ std::string SanitizeUrlForLog (const char *pszURL)
 }
 
 
+/* Without any configured socket input otelfwd listens on the default Unix socket of the Domino add-in (domfwd), so that neither side
+   needs a setting. Without a push target there is nothing to forward: no default listener then, unless standalone mode, which reports
+   the missing target as an error. The file input does not change that: it is one more input, and it does not stop the other listeners.
+   One rule for main, for the summary at start and for -cfg */
+static bool UseDefaultUnixSocket()
+{
+    return IsNullStr (g_szUnixSocketPath) && IsNullStr (g_szTcpListen) && IsNullStr (g_szSyslogSocketPath) && (g_NoStdin || (false == IsNullStr (g_szOtlpPushApiURL)));
+}
+
+
+static std::string GetDefaultUnixSocketPath()
+{
+    return std::string (g_szDataDir) + "/domino/otelfwd.sock";
+}
+
+
 /* One line of the summary at start: "Name: value". The names are those of -cfg */
 static void LogSetting (const char *pszName, const std::string& Value)
 {
@@ -2873,6 +3120,28 @@ void LogStartupSummary (bool bWalOpened)
     LogSetting ("OTLP Service Name",      g_szOtlpServiceName);
     LogSetting ("OTLP Service Namespace", g_szServiceNamespace);
     LogSetting ("OTLP Service Instance",  g_szServiceInstanceId);
+
+    /* The inputs which listen: what is configured, or the default socket. They need a push target: without one they are reported and
+       disabled later */
+    if (false == IsNullStr (g_szUnixSocketPath))
+        LogSetting ("Unix Socket", g_szUnixSocketPath);
+    else if (UseDefaultUnixSocket())
+        LogSetting ("Unix Socket", GetDefaultUnixSocketPath() + " (default)");
+
+    if (false == IsNullStr (g_szTcpListen))
+        LogSetting ("TCP Listen", g_szTcpListen);
+
+    if (false == IsNullStr (g_szSyslogSocketPath))
+        LogSetting ("Syslog Socket", g_szSyslogSocketPath);
+
+    if (false == IsNullStr (g_szFileInput))
+    {
+        LogSetting ("File Input",      g_bFileInputEnabled ? std::string (g_szFileInput) : std::string (g_szFileInput) + " (not used: it needs OTLP_PUSH_API_URL)");
+        LogSetting ("File Start",      g_bFileStartAtEnd ? "end (without a state file only the lines which are written later)" : "begin");
+        LogSetting ("File Severity",   (0 == g_FileSeverityNumber) ? "off (the lines have no severity)" : g_szFileSeverityText);
+        LogSetting ("File Service",    IsNullStr (g_szFileService) ? std::string ("not set (service.name is ") + g_szOtlpServiceName + ")" : std::string (g_szFileService));
+        LogSetting ("File State File", g_szFileStateFile);
+    }
 
     if (0 == g_NoStdin)
     {
@@ -2937,6 +3206,32 @@ void ValidateWalMaxConfig()
     {
         snprintf (szMessage, sizeof (szMessage), "%s has to be a number of MB from 0 (no limit) to %d. Using the default of %d MB",
                   g_szEnvOtlpPushWalMaxMB, OTELFWD_MAX_WAL_MAX_MB, OTELFWD_DEFAULT_WAL_MAX_MB);
+        LogError (szMessage, pValue);
+    }
+}
+
+
+/* Checks OTELFWD_FILE_START and OTELFWD_FILE_SEVERITY at start. The values were read before (see main): an invalid one is reported,
+   and the default is used (begin, info) */
+void ValidateFileConfig()
+{
+    const char *pValue = getenv (g_szEnvFileStart);
+    bool        bAtEnd = false;
+    int         Number = 0;
+    std::string Text;
+    char        szMessage[300] = {0};
+
+    if ( pValue && *pValue && (false == ParseFileStart (pValue, bAtEnd)) )
+    {
+        snprintf (szMessage, sizeof (szMessage), "%s has to be begin or end. Using begin", g_szEnvFileStart);
+        LogError (szMessage, pValue);
+    }
+
+    pValue = getenv (g_szEnvFileSeverity);
+
+    if ( pValue && *pValue && (false == FileSeverity::Parse (pValue, Number, Text)) )
+    {
+        snprintf (szMessage, sizeof (szMessage), "%s has to be trace, debug, info, warn, error, fatal or off. Using info", g_szEnvFileSeverity);
         LogError (szMessage, pValue);
     }
 }
@@ -3123,7 +3418,15 @@ void PrintHelp ()
     LogHelpEnv (g_szEnvTcpListen,             "Loopback TCP address to receive records (example: 127.0.0.1:4390)");
     LogHelpEnv (g_szEnvSyslogSocket,          "Unix datagram socket to receive syslog messages, for example from NGINX (only enabled if set)");
     LogHelpEnv (g_szEnvSyslogSocketMode,      "Syslog socket file mode in octal (default: 0600)");
-    LogHelpEnv (g_szEnvSocketQueueMax,        "Max queued records before socket input drops records (default: 100000)");
+    LogHelpEnv (g_szEnvSocketQueueMax,        "Max queued records before socket input drops records (default: 100000). The file input reads only while the queue has room");
+
+    g_List.AddText ("");
+
+    LogHelpEnv (g_szEnvFileInput,             "File to follow (like tail -F), one log record for every line. Needs OTLP_PUSH_API_URL. Rotation, truncation and restarts are handled");
+    LogHelpEnv (g_szEnvFileStart,             "Where to start without a state file: begin (default) or end");
+    LogHelpEnv (g_szEnvFileStateDir,          "Directory for the state file of the file input (default: next to the file, as <file>.otelfwd-state)");
+    LogHelpEnv (g_szEnvFileSeverity,          "Severity of every line of the file input: trace, debug, info, warn, error, fatal or off for none (default: info)");
+    LogHelpEnv (g_szEnvFileService,           "service.name and service.namespace of the lines of the file input (default: OTLP_SERVICE_NAME and OTLP_SERVICE_NAMESPACE)");
 
     g_List.AddText ("");
     g_List.AddText ("Command Line :");
@@ -3223,7 +3526,13 @@ void DumpConfig (bool bShowEnvVars = false)
 
     snprintf (szMode, sizeof (szMode), "%04o", static_cast<unsigned int>(g_UnixSocketMode));
 
-    LogCfgText (bShowEnvVars, "Unix Socket",             g_szUnixSocketPath,   g_szEnvUnixSocket);
+    /* -cfg shows the socket which is used: the default one if none is set. -env only shows what can be set */
+    std::string UnixSocket = g_szUnixSocketPath;
+
+    if ( (false == bShowEnvVars) && UseDefaultUnixSocket() )
+        UnixSocket = GetDefaultUnixSocketPath() + " (default)";
+
+    LogCfgText (bShowEnvVars, "Unix Socket",             UnixSocket.c_str(),   g_szEnvUnixSocket);
     LogCfgText (bShowEnvVars, "Unix Socket Mode",        szMode,               g_szEnvUnixSocketMode);
 
     snprintf (szMode, sizeof (szMode), "%04o", static_cast<unsigned int>(g_SyslogSocketMode));
@@ -3232,6 +3541,15 @@ void DumpConfig (bool bShowEnvVars = false)
     LogCfgText (bShowEnvVars, "Syslog Socket Mode",      szMode,               g_szEnvSyslogSocketMode);
     LogCfgText (bShowEnvVars, "TCP Listen",              g_szTcpListen,        g_szEnvTcpListen);
     LogCfgNum  (bShowEnvVars, "Socket Queue Max",        g_SocketQueueMax,     g_szEnvSocketQueueMax);
+
+    g_List.AddText ("");
+
+    LogCfgText (bShowEnvVars, "File Input",              g_szFileInput,        g_szEnvFileInput);
+    LogCfgText (bShowEnvVars, "File Start",              g_bFileStartAtEnd ? "end" : "begin", g_szEnvFileStart);
+    LogCfgText (bShowEnvVars, "File State Dir",          g_szFileStateDir,     g_szEnvFileStateDir);
+    LogCfgText (bShowEnvVars, "File Severity",           (0 == g_FileSeverityNumber) ? "off" : g_szFileSeverityText, g_szEnvFileSeverity);
+    LogCfgText (bShowEnvVars, "File Service",            g_szFileService,      g_szEnvFileService);
+    LogCfgText (bShowEnvVars, "File State File",         g_szFileStateFile);
 
     g_List.AddText ("");
 
@@ -3425,6 +3743,42 @@ int main (int argc, char *argv[])
     if (p)
         snprintf (g_szTcpListen, sizeof (g_szTcpListen), "%s", p);
 
+    /* The file input. The paths are made absolute: the name of the state file is made from the path, and it has to be the same every time */
+    p = getenv (g_szEnvFileInput);
+    if (p && *p)
+        MakeAbsolutePath (p, g_szFileInput, sizeof (g_szFileInput));
+
+    /* Without a directory the state file is next to the file */
+    p = getenv (g_szEnvFileStateDir);
+    if (p && *p)
+        MakeAbsolutePath (p, g_szFileStateDir, sizeof (g_szFileStateDir));
+
+    /* An invalid value is reported at start (ValidateFileStart) and begin is used */
+    p = getenv (g_szEnvFileStart);
+    if (p && *p)
+        ParseFileStart (p, g_bFileStartAtEnd);
+
+    /* An invalid value is reported at start (ValidateFileConfig) and info is used */
+    p = getenv (g_szEnvFileSeverity);
+    if (p && *p)
+    {
+        int         Number = 0;
+        std::string Text;
+
+        if (FileSeverity::Parse (p, Number, Text))
+        {
+            g_FileSeverityNumber = Number;
+            snprintf (g_szFileSeverityText, sizeof (g_szFileSeverityText), "%s", Text.c_str());
+        }
+    }
+
+    p = getenv (g_szEnvFileService);
+    if (p && *p)
+        snprintf (g_szFileService, sizeof (g_szFileService), "%s", p);
+
+    if (false == IsNullStr (g_szFileInput))
+        snprintf (g_szFileStateFile, sizeof (g_szFileStateFile), "%s", FileStateName::Make (g_szFileStateDir, g_szFileInput).c_str());
+
     p = getenv (g_szEnvOutputLog);
     if (p)
         snprintf (g_szOutputLogFile, sizeof (g_szOutputLogFile), "%s", p);
@@ -3490,6 +3844,7 @@ int main (int argc, char *argv[])
     ValidatePushEncoding();
     ValidateWalRetryConfig();
     ValidateWalMaxConfig();
+    ValidateFileConfig();
     ValidateBackupConfig();
 
     /* The backup is only used if it is configured, and it is checked above: an invalid one was removed */
@@ -3517,6 +3872,9 @@ int main (int argc, char *argv[])
     if (*g_szOtlpPushApiURL)
         g_bWalOpened = g_Wal.Init (g_szWalFile);
 
+    /* Like the socket inputs, the file input needs a push target: without one the lines have nowhere to go */
+    g_bFileInputEnabled = (false == IsNullStr (g_szFileInput)) && (false == IsNullStr (g_szOtlpPushApiURL));
+
     LogStartupSummary (g_bWalOpened);
 
     curl_global_init (CURL_GLOBAL_DEFAULT);
@@ -3526,19 +3884,48 @@ int main (int argc, char *argv[])
         g_fdOutputLogFile = open (g_szOutputLogFile, O_CREAT | O_APPEND | O_WRONLY, 0644);
     }
 
-    /* Without any configured socket input listen on the default Unix socket of the Domino add-in (domfwd),
-       so that neither side needs a setting. Without a push target there is nothing to forward: no default
-       listener then, unless standalone mode, which reports the missing target as an error below. */
-    if (IsNullStr (g_szUnixSocketPath) && IsNullStr (g_szTcpListen) && IsNullStr (g_szSyslogSocketPath) && (g_NoStdin || (false == IsNullStr (g_szOtlpPushApiURL))))
+    /* The file input: the reader is opened here, and the thread is started with the others. Nothing is read yet */
+    if (false == IsNullStr (g_szFileInput))
     {
-        snprintf (g_szUnixSocketPath, sizeof (g_szUnixSocketPath), "%s/domino/otelfwd.sock", g_szDataDir);
-        MakeDirectoryTreeFromFileName (g_szUnixSocketPath);
+        if (false == g_bFileInputEnabled)
         {
-            char szDefaultMsg[1300] = {0};
-
-            snprintf (szDefaultMsg, sizeof (szDefaultMsg), "No socket input configured, using the default Unix socket: %s", g_szUnixSocketPath);
-            LogMessage (szDefaultMsg);
+            LogError ("The file input needs OTLP_PUSH_API_URL. The file input is disabled");
         }
+        else
+        {
+            /* A directory which was asked for is made. The directory of the file itself is not: the program which writes the file makes it */
+            if (false == IsNullStr (g_szFileStateDir))
+                MakeDirectoryTreeFromFileName (g_szFileStateFile);
+
+            /* The state file is written next to the file by default, and that directory may belong to somebody else, or be read only.
+               Then the position cannot be saved, and every restart reads the file again from the beginning */
+            {
+                std::string StateDir  = g_szFileStateFile;
+                size_t      Slash     = StateDir.rfind ('/');
+                struct stat DirStat {};
+
+                StateDir = (std::string::npos == Slash) ? std::string (".") : ((0 == Slash) ? std::string ("/") : StateDir.substr (0, Slash));
+
+                if ( (0 == stat (StateDir.c_str(), &DirStat)) && (0 != access (StateDir.c_str(), W_OK | X_OK)) )
+                    LogError ("The directory of the state file of the file input is not writable: the position cannot be saved, and a restart reads the file again. Set OTELFWD_FILE_STATE_DIR", StateDir.c_str());
+            }
+
+            g_FileReader.SetStartAtEnd (g_bFileStartAtEnd);
+            g_FileReader.SetLogFunction ([] (const char *pszMessage) { LogMessage (pszMessage); });
+
+            if (false == g_FileReader.Open (g_szFileInput, g_szFileStateFile))
+            {
+                LogError ("The file input cannot be started", g_szFileInput);
+                g_bFileInputEnabled = false;
+            }
+        }
+    }
+
+    /* The default Unix socket, see UseDefaultUnixSocket(). The summary at start has told which one it is */
+    if (UseDefaultUnixSocket())
+    {
+        snprintf (g_szUnixSocketPath, sizeof (g_szUnixSocketPath), "%s", GetDefaultUnixSocketPath().c_str());
+        MakeDirectoryTreeFromFileName (g_szUnixSocketPath);
     }
 
     /* Socket inputs. Records received there are pushed via OTLP, so they need an OTLP endpoint.
@@ -3565,9 +3952,9 @@ int main (int argc, char *argv[])
 
     /* Without STDIN the socket inputs are the only source. Without one there is nothing to do.
        Exit with an error instead of running idle, so a service manager does not consider it healthy. */
-    if (g_NoStdin && (false == g_IngestUnix.bEnabled) && (false == g_IngestTcp.bEnabled) && (false == g_IngestSyslog.bEnabled))
+    if (g_NoStdin && (false == g_IngestUnix.bEnabled) && (false == g_IngestTcp.bEnabled) && (false == g_IngestSyslog.bEnabled) && (false == g_bFileInputEnabled))
     {
-        LogError ("-nostdin needs at least one working socket input (OTELFWD_UNIX_SOCKET, OTELFWD_TCP_LISTEN or OTELFWD_SYSLOG_SOCKET, and OTLP_PUSH_API_URL)");
+        LogError ("-nostdin needs at least one working input (OTELFWD_UNIX_SOCKET, OTELFWD_TCP_LISTEN, OTELFWD_SYSLOG_SOCKET or OTELFWD_FILE_INPUT, and OTLP_PUSH_API_URL)");
         ExitCode = 1;
         goto Done;
     }
@@ -3610,6 +3997,14 @@ int main (int argc, char *argv[])
             return EXIT_FAILURE;
     }
 
+    if (g_bFileInputEnabled)
+    {
+        g_FileThreadRunning = 1;
+
+        if (false == CreateThread (&g_FileThreadInstance, FileThread, NULL))
+            return EXIT_FAILURE;
+    }
+
     if (g_Mirror2Stdout && (0 == g_NoStdin))
     {
         if (g_DumpEnvironment)
@@ -3619,7 +4014,7 @@ int main (int argc, char *argv[])
     /* Without STDIN the socket input threads do all the work. Wait for SIGTERM/SIGINT */
     if (g_NoStdin)
     {
-        LogMessage ("Running without STDIN input. Serving socket inputs until SIGTERM or SIGINT");
+        LogMessage ("Running without STDIN input. Serving the inputs until SIGTERM or SIGINT");
 
         while (0 == g_ShutdownRequested)
             sleep_ms (200);
@@ -3690,9 +4085,9 @@ int main (int argc, char *argv[])
 
     g_ShutdownRequested = 1;
 
-    /* Wait for the socket inputs to stop, before the queue is shut down. Nothing is queued after that */
+    /* Wait for the socket inputs and the file input to stop, before the queue is shut down. Nothing is queued after that */
     seconds = 0;
-    while ( (g_IngestUnix.Running || g_IngestTcp.Running || g_IngestSyslog.Running) && (seconds < 200) )
+    while ( (g_IngestUnix.Running || g_IngestTcp.Running || g_IngestSyslog.Running || g_FileThreadRunning) && (seconds < 200) )
     {
         sleep_ms (50);
         seconds++;
@@ -3722,6 +4117,17 @@ int main (int argc, char *argv[])
             LogError (szThreadMessage);
             break;
         }
+    }
+
+    /* The push thread delivered the last batches after the file thread had ended. Their positions are committed here, where the reader is
+       not used by a thread any more: a restart does not repeat lines which were delivered */
+    if (g_bFileInputEnabled && (0 == g_FileThreadRunning))
+    {
+        uint64_t Generation = 0;
+        uint64_t EndOffset  = 0;
+
+        if (g_FileCommit.Take (Generation, EndOffset))
+            g_FileReader.Commit (Generation, EndOffset);
     }
 
 Done:

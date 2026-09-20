@@ -38,7 +38,7 @@ One event, as sent to `otelfwd`:
   "severity_number": 17,
   "severity_text": "ERROR",
   "body": "Database compactor error: File does not exist",
-  "scope": { "name": "domino.event" },
+  "scope": { "name": "domino.event", "version": "0.9.0" },
   "resource": {
     "service.name": "domino",
     "service.instance.id": "CN=makemake/O=NotesLab",

@@ -11,6 +11,7 @@ The repository has two programs which work together, and some tools to test them
 | [`nginx/`](nginx/README.md)                           | Test NGINX container which logs via syslog into `otelfwd`, and the end to end load test                                                 |
 | [`tools/victorialogs/`](tools/victorialogs/README.md) | VictoriaLogs container: a real log database to try `otelfwd` with. It needs `OTLP_PUSH_ENCODING=protobuf`                               |
 | [`wal/`](wal/README.md)                               | The write ahead log of `otelfwd` as a module of its own: usable by other programs, with a sample program and its tests                  |
+| [`filereader/`](filereader/README.md)                 | Follows a growing text file line by line and remembers its position. A module of its own, used by the file input of `otelfwd`          |
 | [`tools/otel-sink/`](tools/otel-sink/README.md)       | Test OTLP receiver container                                                                                                            |
 
 `otelfwd` is general purpose. Everything which can write a line of text or a JSON record to a local socket can use it, for example NGINX. The Domino specific parts are the console log annotation and `domfwd`.
@@ -50,7 +51,7 @@ Network interfaces of `otelfwd`:
 
 | Direction | Interface                                           | Notes                                                                                                                                                                                                                           |
 | :-------- | :-------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| In        | STDIN, UNIX socket, syslog datagram socket          | Local only, no network                                                                                                                                                                                                          |
+| In        | STDIN, UNIX socket, syslog datagram socket, a file  | Local only, no network                                                                                                                                                                                                          |
 | In        | TCP on loopback (`OTELFWD_TCP_LISTEN`)              | Loopback only. Off unless configured. No default port, the examples use `127.0.0.1:4390`                                                                                                                                        |
 | Out       | HTTP or HTTPS to the receiver (`OTLP_PUSH_API_URL`) | The only network connection. No default: the URL sets host and port (OTLP/HTTP standard: 4318, Loki: 3100). Use `https://` with `OTLP_CA_FILE` for a private CA and `OTLP_PUSH_TOKEN` for a bearer token. Needs outbound access |
 
@@ -59,6 +60,7 @@ Inputs:
 * **STDIN:** the console log of a Domino server (`server | otelfwd`), annotated with the server task from `pid.nbf`. See [Domino console log (STDOUT)](#domino-console-log-stdout).
 * **UNIX socket** and **TCP on 127.0.0.1:** structured records in the [flat record format](#records-received-via-socket-inputs) from other local programs, above all the Domino event add-in [`domfwd`](domfwd/README.md). TCP is loopback only. See [Domino events (domfwd)](#domino-events-domfwd).
 * **Syslog** (UNIX datagram socket, only if enabled): syslog messages, for example the access and error log of NGINX. See [Syslog input](#syslog-input).
+* **File** (only if enabled): the lines of a text file which grows, with its position saved across restarts, rotation and truncation. See [File input](#file-input).
 
 What `otelfwd` does with them:
 
@@ -124,7 +126,7 @@ It is not a process supervisor or init replacement.
 | :---------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------- | :---------------- | :--------------------------------- |
 | Pipe (default)          | `server \| otelfwd`                                                                                                                              | STDIN             | STDIN is closed (the server stops) |
 | Pipe with socket inputs | `server \| otelfwd` and `OTELFWD_UNIX_SOCKET` and/or `OTELFWD_TCP_LISTEN` (default: [UNIX socket](#socket-inputs) if `OTLP_PUSH_API_URL` is set) | STDIN and sockets | STDIN is closed                    |
-| Standalone              | `otelfwd -nostdin` (and `OTLP_PUSH_API_URL`)                                                                                                     | sockets only      | `SIGTERM` or `SIGINT`              |
+| Standalone              | `otelfwd -nostdin` (and `OTLP_PUSH_API_URL`)                                                                                                     | sockets and file  | `SIGTERM` or `SIGINT`              |
 
 ### Pipe mode
 
@@ -148,11 +150,11 @@ export OTELFWD_UNIX_SOCKET=/run/otelfwd/otelfwd.sock    # optional, default: <da
 otelfwd -nostdin
 ```
 
-* `OTLP_PUSH_API_URL` has to be set, and at least one socket input has to work. Without a configured socket input the default UNIX socket is used. Otherwise the forwarder logs an error and ends with exit code 1.
+* `OTLP_PUSH_API_URL` has to be set, and at least one input has to work: a socket input, or the [file input](#file-input). Without a configured input the default UNIX socket is used. Otherwise the forwarder logs an error and ends with exit code 1.
 * `OTELFWD_DATA_DIR` is the directory for the WAL and for the metrics file. It has to be writable. See [Additional configuration](#additional-configuration).
 * `OTELFWD_MIRROR_STDOUT` and `OTELFWD_OUTPUT_LOG` only apply to lines read from STDIN. They are ignored with `-nostdin` and a warning is logged.
 * The WAL is replayed while the forwarder is running. Records received before a shutdown are pushed first, and records which could not be pushed stay in the WAL for the next start.
-* Only records received via the socket inputs are pushed. They carry their own attributes. The annotation with the Domino server task name via `pid.nbf` only applies to lines read from STDIN.
+* Only records received via the socket inputs and the file input are pushed. They carry their own attributes. The annotation with the Domino server task name via `pid.nbf` only applies to lines read from STDIN.
 
 ## Command line
 
@@ -186,6 +188,7 @@ At every start `otelfwd` logs the configuration which is in use, to stderr, one 
 2026-09-19T21:34:01Z  otelfwd: OTLP Service Name: domino
 2026-09-19T21:34:01Z  otelfwd: OTLP Service Namespace: domino
 2026-09-19T21:34:01Z  otelfwd: OTLP Service Instance: domino1
+2026-09-19T21:34:01Z  otelfwd: Unix Socket: /local/notesdata/domino/otelfwd.sock (default)
 2026-09-19T21:34:01Z  otelfwd: Output log: /local/notesdata/notes.log
 2026-09-19T21:34:01Z  otelfwd: Mirror to stdout: yes
 ```
@@ -200,6 +203,7 @@ Every line of the console output of `otelfwd` starts with the time in UTC (ISO 8
 * **The values which are really used** are shown, after the checks of the configuration. If a setting was invalid and was replaced or ignored, an error line before these lines says so, and the summary shows the result, for example no backup endpoint.
 * **No secrets.** The token is only shown as `set` or `not set`. The URLs are shown without user name, password, query and fragment, because a URL can carry a secret there (`https://user:password@host/path?token=...`). `-cfg` and `-env` do the same.
 * Without `OTLP_PUSH_API_URL` the summary says that OTLP push is off and leaves out the settings of the push. The settings of the backup endpoint, `WAL Pending` and the output log are only there when they are used. If the WAL cannot be opened, the `WAL File` line says so.
+* **The sockets** which are used are listed: `Unix Socket`, `TCP Listen` and `Syslog Socket` if they are set, and the default Unix socket, marked `(default)`, when none is set (see [Socket inputs](#socket-inputs)). The lines of the [file input](#file-input) are there when it is set.
 * With `-nostdin` the lines have no `otelfwd:` after the time. It is there in pipe mode, where the lines share the output with the mirrored lines of the server.
 * The mirrored lines of the server on stdout, the output log file, and the output of `-cfg` and `-help` have no time stamp.
 * `-cfg` shows everything, also the settings which are not set. See [Command line](#command-line).
@@ -277,7 +281,7 @@ An input that cannot be started is logged and skipped. Reading from STDIN contin
 | `OTELFWD_TCP_LISTEN`       | Loopback TCP address to receive records                                                                                                     | `127.0.0.1:4390` or `[::1]:4390` |
 | `OTELFWD_SOCKET_QUEUE_MAX` | Max queued records before records are dropped                                                                                               | default: `100000`                |
 
-* **Default socket:** if `OTLP_PUSH_API_URL` is set and none of `OTELFWD_UNIX_SOCKET`, `OTELFWD_TCP_LISTEN` and `OTELFWD_SYSLOG_SOCKET` is configured, the forwarder listens on `<OTELFWD_DATA_DIR>/domino/otelfwd.sock` and creates the directory if needed. This is where the Domino add-in [`domfwd`](domfwd/README.md) sends by default, so both sides need no setting. `-cfg` only shows explicitly configured sockets. Setting any socket input turns the default off.
+* **Default socket:** if `OTLP_PUSH_API_URL` is set and none of `OTELFWD_UNIX_SOCKET`, `OTELFWD_TCP_LISTEN` and `OTELFWD_SYSLOG_SOCKET` is configured, the forwarder listens on `<OTELFWD_DATA_DIR>/domino/otelfwd.sock` and creates the directory if needed. This is where the Domino add-in [`domfwd`](domfwd/README.md) sends by default, so both sides need no setting. `-cfg` and the [log at start](#log-at-start) show the socket which is used, marked `(default)`. With `-cfg` this follows the parameters in the order they are given: `-nostdin` counts only if it comes before `-cfg`. `-env` only shows what can be set. Setting any socket input turns the default off. The file input does not: it is one more input.
 * The socket is created with the mode `OTELFWD_UNIX_SOCKET_MODE` (default `0600`). Only the user who started the forwarder can connect. Start `otelfwd` as the same user as the Domino server.
 * The TCP input has no authentication and no encryption. It only accepts loopback addresses (`127.0.0.0/8` or `::1`) and refuses to start on any other address.
 * A stale UNIX socket file of an earlier run is replaced. A socket which is in use by another process, or a file which is not a socket, is never removed.
@@ -325,6 +329,39 @@ error_log  syslog:server=unix:/run/otelfwd/syslog.sock,tag=nginx_error;
 ```
 
 The access log should use a JSON `log_format` with `escape=json` and OpenTelemetry attribute names as keys. The `combined` format also works, but it arrives as plain text in the body without attributes.
+
+### File input
+
+`otelfwd` can follow **a text file** like `tail -F` and push every line as a log record. It is meant for logs of programs which write to a file and have no other way to send their logs. It is only enabled if requested. It runs in its own thread and needs `OTLP_PUSH_API_URL`. It works in pipe mode and in standalone mode (`-nostdin`), and one file is followed for now.
+
+| Variable Name            | Description                                                                                                                                                                    | Example / Comments                                        |
+| :----------------------- | :----------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | :-------------------------------------------------------- |
+| `OTELFWD_FILE_INPUT`     | The file to follow. The file input is enabled if it is set. The file does not have to exist yet                                                                                | `/var/log/myapp/app.log`                                  |
+| `OTELFWD_FILE_START`     | Where to start when there is no state file (the first start): `begin` reads what is in the file, `end` only lines which come later                                             | default: `begin`                                          |
+| `OTELFWD_FILE_STATE_DIR` | A directory for the state files, if they should not be next to the files                                                                                                       | default: next to the file: `<file>.otelfwd-state`         |
+| `OTELFWD_FILE_SEVERITY`  | The severity of every line: `trace`, `debug`, `info`, `warn`, `error`, `fatal`, or `off` for no severity. A text file has no level of its own, so it is one for the whole file | default: `info`                                           |
+| `OTELFWD_FILE_SERVICE`   | `service.name` and `service.namespace` of the lines: the name of the program which writes the file                                                                             | default: `OTLP_SERVICE_NAME` and `OTLP_SERVICE_NAMESPACE` |
+
+**The record:** the line is the body, without the new line (and without a carriage return before it). The time is the time the line was read. The severity is the same for every line (`OTELFWD_FILE_SEVERITY`, `info` by default): a text file has no level, and `off` sends no severity at all. The attribute `log.file.path` is the path of the file. The resource is the default resource of the forwarder (`host.name`, ...), with `service.name` and `service.namespace` from `OTELFWD_FILE_SERVICE` if it is set. The scope is the default scope. Empty lines are not sent. A line which is longer than 1 MB is cut, the rest of it is dropped, and `otelfwd_file_lines_truncated_total` counts it.
+
+**The position is saved when the lines are delivered**, not when they are read. The file is read by the [`FileReader`](filereader/README.md), which keeps the position in a **state file**: next to the file by default (`/var/log/myapp/app.log` has `/var/log/myapp/app.log.otelfwd-state`), or in `OTELFWD_FILE_STATE_DIR` if that is set (`app.log.<hash of the path>.otelfwd-state`: the hash keeps two files with the same name apart, and one directory can hold the state files of many files). The directory has to be writable for `otelfwd`. If it is not (a read only mount, or a directory of another user), `otelfwd` says so at start, the position cannot be saved, and every restart reads the file again: set `OTELFWD_FILE_STATE_DIR` then. `otelfwd` commits it when a batch was accepted by the receiver, or written to the WAL, or refused as bad data. After a restart or a crash `otelfwd` continues at that position. Lines which were read but not delivered are read again, so the delivery is **at least once**, like the [WAL](#durable-log-delivery). The state file is only for the owner (0600), and it belongs to the path: do not delete it unless the file should be read again.
+
+* **Only complete lines.** A line which the program has not finished writing waits until its new line arrives.
+* **Rotation** (the file is renamed and a new one is created, like `logrotate` does): the old file is read to its end, then the new file is read from the start. **Truncation** (`copytruncate`, or an emptied file): the file is read again from the start.
+* **Backpressure.** The file input only reads while the queue has room (`OTELFWD_SOCKET_QUEUE_MAX`). When the receiver is slow, the queue fills up and the file simply waits: nothing is dropped, the file is the buffer. If the file is rotated away meanwhile, the lines which were not read yet are in the old file, and they are read first.
+* **Where it starts:** without a state file the file is read from the beginning (`OTELFWD_FILE_START=begin`), which sends a large old file completely. With `end` only lines which come later are sent, and the position is saved at once. A state file which is damaged, or which belongs to another file (the file was replaced while `otelfwd` was stopped), is reported, and the file is read from the start.
+* **Other inputs:** the file input is one more input. It does not stop the others: the default Unix socket (for `domfwd`) is still opened when no socket input is configured, in pipe mode and with `-nostdin`. With `-nostdin` the file input also counts as a working input, so a file-only run does not end with an error.
+* **What it does not do:** several files or patterns (one file for now), the joining of lines which belong together (a stack trace), and parsing of a time or a severity out of the line (the severity is the one of the setting for every line).
+
+```bash
+export OTLP_PUSH_API_URL=https://otel.example.com:4318/v1/logs
+export OTELFWD_FILE_INPUT=/var/log/myapp/app.log
+export OTELFWD_FILE_START=end
+
+otelfwd -nostdin
+```
+
+The module has a test of its own, see [filereader/README.md](filereader/README.md#test). `make test` runs it. The names of the state files and the hand over of the position from the push thread to the file thread are tested in [`otelfwd_unit_test.cpp`](#unit-test-of-otelfwd).
 
 ## Durable Log Delivery
 
@@ -419,7 +456,8 @@ Example: a Domino event.
   "severity_text": "ERROR",
   "body": "Database compactor error: File does not exist",
   "scope": {
-    "name": "domino.event"
+    "name": "domino.event",
+    "version": "0.9.0"
   },
   "resource": {
     "service.name": "domino",
@@ -499,6 +537,7 @@ Both scripts print how many lines were pushed and return an error if the push fa
 | Test                     | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                                                                                            |
 | :----------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | WAL unit test            | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, use from several threads, one record at a time (Peek and Ack), the size limit, its messages, speed ([details](wal/README.md#the-tests))                                          |
+| File reader unit test    | `make test`                                                                                      | a C++ compiler and `make` | The file reader module on its own: complete and unfinished lines, commit and restart, rotation, truncation, damaged state files, long lines ([details](filereader/README.md#test))                                                        |
 | Unit test of otelfwd     | `make test`                                                                                      | a C++ compiler and `make` | The failover between two OTLP endpoints (backup, failback timing, refused data, threads), the converter from JSON to protobuf, and the format of the log lines ([details](#unit-test-of-otelfwd))                                         |
 | Durable sender test      | `make test`                                                                                      | a C++ compiler and `make` | The socket sender of `domfwd` together with the WAL: lines wait on disk while the receiver is down, arrive in order when it is back, survive a restart and the end of the program ([details](#unit-test-of-the-durable-sender-of-domfwd)) |
 | Load test                | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                                                                                 |
@@ -588,6 +627,10 @@ Metrics are written to the Prometheus file (`OTELFWD_PROM_FILE`) every 10 second
 | `otelfwd_push_rejected_total`                           | Push requests which the receiver refused as bad data (HTTP 400) and which were dropped                                                                    |
 | `otelfwd_wal_bytes`                                     | Gauge. Size of the WAL: push requests which wait on disk for the receiver. Only with a push target                                                        |
 | `otelfwd_wal_refused_total`                             | Push requests which the WAL did not take (it was full, or a failure). They are lost. Only with a push target                                              |
+| `otelfwd_file_lines_total`                              | Lines read from the file input and queued. Empty lines are skipped. Only with a file input                                                                |
+| `otelfwd_file_lines_truncated_total`                    | Lines of the file input which were longer than 1 MB and were cut                                                                                          |
+| `otelfwd_file_committed_offset_bytes`                   | Gauge. The position in the file up to which the lines were delivered. It starts at 0 again when the file is rotated or truncated                          |
+| `otelfwd_file_open`                                     | Gauge. 1 if the file is open, 0 if it does not exist (yet)                                                                                                |
 | `otelfwd_health`                                        | Gauge. Health for alerting: 0 is OK, 1 is a warning, 2 is an error, see [Health](#health)                                                                 |
 | `otelfwd_push_endpoint_active`                          | Gauge. The endpoint in use: 0 is the primary, 1 is the backup                                                                                             |
 | `otelfwd_push_endpoint_requests_total{endpoint,result}` | Push requests to an endpoint (`primary`, `backup`). `result`: `accepted`, `retry`, `rejected`. A try of the primary while the backup is in use counts too |

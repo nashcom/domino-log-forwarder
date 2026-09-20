@@ -11,6 +11,11 @@ WAL_DIR  = wal
 WAL_SRC  = $(WAL_DIR)/simple_wal.cpp
 WAL_HDR  = $(WAL_DIR)/simple_wal.hpp
 
+# The file reader is a module of its own too, with its test and its README: see filereader/README.md. otelfwd uses it for the file input
+FILEREADER_DIR = filereader
+FILEREADER_SRC = $(FILEREADER_DIR)/file_reader.cpp
+FILEREADER_HDR = $(FILEREADER_DIR)/file_reader.hpp
+
 PUSH_HDR = push_status.hpp push_failover.hpp otlp_protobuf.hpp
 LOG_HDR  = log_line.hpp
 
@@ -22,7 +27,7 @@ all: $(TARGET)
 # Builds and runs the unit tests: the WAL (in wal/, with its sample program), and the pieces of otelfwd (failover between two OTLP
 # endpoints, JSON to protobuf converter, log lines). Both run, even if one fails
 test: $(TARGET_TEST)
-	@fail=0; $(MAKE) -C $(WAL_DIR) test || fail=1; for t in $(TARGET_TEST); do ./$$t || fail=1; done; exit $$fail
+	@fail=0; $(MAKE) -C $(WAL_DIR) test || fail=1; $(MAKE) -C $(FILEREADER_DIR) test || fail=1; for t in $(TARGET_TEST); do ./$$t || fail=1; done; exit $$fail
 
 # The WAL test with ThreadSanitizer, see wal/makefile. Not part of "make test": it needs g++ with the sanitizer library (libtsan)
 tsan:
@@ -32,12 +37,12 @@ tsan:
 wal_sample:
 	$(MAKE) -C $(WAL_DIR) wal_sample
 
-otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(PUSH_HDR) $(LOG_HDR) health.hpp
-	$(CXX) $(CXXFLAGS) -I$(WAL_DIR) -o $@ otelfwd.cpp $(WAL_SRC) $(LDFLAGS)
+otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(FILEREADER_SRC) $(FILEREADER_HDR) $(PUSH_HDR) $(LOG_HDR) health.hpp file_input.hpp
+	$(CXX) $(CXXFLAGS) -I$(WAL_DIR) -I$(FILEREADER_DIR) -o $@ otelfwd.cpp $(WAL_SRC) $(FILEREADER_SRC) $(LDFLAGS)
 
 # Unit test of the failover (push_failover.hpp), of the converter (otlp_protobuf.hpp) and of the log lines (log_line.hpp). No network
 # Needs the rapidjson headers
-otelfwd_unit_test: otelfwd_unit_test.cpp $(PUSH_HDR) $(LOG_HDR)
+otelfwd_unit_test: otelfwd_unit_test.cpp $(PUSH_HDR) $(LOG_HDR) file_input.hpp
 	$(CXX) $(CXXFLAGS) -pthread -o $@ otelfwd_unit_test.cpp
 
 # Unit test of the durable line sender of domfwd: the socket sender and the WAL together. It starts a small server of its own on
@@ -62,4 +67,5 @@ clean:
 	rm -f loadtest
 	rm -f *.o
 	$(MAKE) -C $(WAL_DIR) clean
+	$(MAKE) -C $(FILEREADER_DIR) clean
 

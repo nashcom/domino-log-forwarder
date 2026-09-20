@@ -22,6 +22,10 @@
    3. The console output of otelfwd (log_line.hpp): the time stamp in UTC, the two blanks, the process name, the level. The times
       are what the date command says for the same number of seconds, also when the host time zone is far from UTC.
 
+   4. The file input (file_input.hpp): the names of the severities, the names of the state files, and how the push thread hands over the
+      position up to which lines were delivered to the file thread. The names of two paths are written down in the test: a name which changes between versions
+      loses the position of every file. The file itself is read by the FileReader, which has a test of its own (filereader/).
+
    Build and run:  make otelfwd_unit_test && ./otelfwd_unit_test        (or: make test)
 
    Every check prints [PASS] or [FAIL]. The end of the output has a section "Failed checks" (only if there are any) and a
@@ -41,6 +45,7 @@
 #include "push_failover.hpp"
 #include "otlp_protobuf.hpp"
 #include "log_line.hpp"
+#include "file_input.hpp"
 
 
 static int g_Total  = 0;
@@ -852,6 +857,175 @@ static void TestLogOutput ()
 }
 
 
+/* The names of OTELFWD_FILE_SEVERITY. The numbers are those of the OpenTelemetry log data model */
+static void TestFileSeverity ()
+{
+    struct Case
+    {
+        const char *pszName;
+        int         Number;
+        const char *pszText;
+    };
+
+    const Case Cases[] =
+    {
+        { "trace", 1, "TRACE" }, { "debug", 5, "DEBUG" }, { "info", 9, "INFO" }, { "warn", 13, "WARN" }, { "warning", 13, "WARN" },
+        { "error", 17, "ERROR" }, { "fatal", 21, "FATAL" }, { "off", 0, "" }, { "none", 0, "" }, { "unspecified", 0, "" },
+        { "INFO", 9, "INFO" }, { "Warning", 13, "WARN" }, { "ERROR", 17, "ERROR" }, { "OFF", 0, "" }
+    };
+
+    for (const Case& Test : Cases)
+    {
+        int         Number = -1;
+        std::string Text   = "unchanged";
+        std::string Name   = std::string ("file severity: ") + Test.pszName + " is number " + std::to_string (Test.Number) + (*Test.pszText ? std::string (" and the text ") + Test.pszText : std::string (" and has no text"));
+
+        Check (FileSeverity::Parse (Test.pszName, Number, Text) && (Test.Number == Number) && (Test.pszText == Text), Name.c_str());
+    }
+
+    int         Number = 9;
+    std::string Text   = "INFO";
+
+    Check (false == FileSeverity::Parse ("verbose", Number, Text), "file severity: an unknown name is refused");
+    Check ( (9 == Number) && ("INFO" == Text), "file severity: and nothing is changed");
+    Check (false == FileSeverity::Parse ("", Number, Text), "file severity: an empty text is refused");
+    Check (false == FileSeverity::Parse (NULL, Number, Text), "file severity: NULL is refused");
+    Check (false == FileSeverity::Parse (" info", Number, Text), "file severity: a blank before the name is refused");
+    Check (false == FileSeverity::Parse ("info ", Number, Text), "file severity: a blank behind the name is refused");
+    Check (false == FileSeverity::Parse ("9", Number, Text), "file severity: a number is refused, the names are the levels");
+}
+
+
+/* The names of the state files. Two of them are written down: they have to stay the same between versions, or every file is read
+   again from the start after an update. The hash is FNV-1a of the path, its low 32 bits as 8 hex digits */
+static void TestFileStateName ()
+{
+    std::string Suffix = ".otelfwd-state";
+
+    Check ("/data/app.log.abd36f6a.otelfwd-state" == FileStateName::Make ("/data", "/var/log/app.log"), "state file name: <directory>/<name>.<hash of the path>.otelfwd-state");
+    Check ("/data/app.log.49cd793a.otelfwd-state" == FileStateName::Make ("/data", "/srv/other/app.log"), "state file name: the same name in another directory has another hash");
+    Check (FileStateName::Make ("/data", "/var/log/app.log") == FileStateName::Make ("/data", "/var/log/app.log"), "state file name: the same path gives the same name every time");
+    Check (FileStateName::Make ("/data", "/var/log/app.log") != FileStateName::Make ("/data", "/var/log/app.log2"), "state file name: a path which differs in one character has another name");
+    Check ("/data/app.log.abd36f6a.otelfwd-state" == FileStateName::Make ("/data/", "/var/log/app.log"), "state file name: a slash at the end of the directory is not doubled");
+    Check ("/var/log/app.log.otelfwd-state" == FileStateName::Make ("", "/var/log/app.log"), "state file name: without a directory it is next to the file: <path>.otelfwd-state");
+    Check ("/var/log/my app (1).log.otelfwd-state" == FileStateName::Make ("", "/var/log/my app (1).log"), "state file name: next to the file the name of the file is kept as it is, and no hash is needed");
+    Check (FileStateName::Make ("", "/var/log/a.log") != FileStateName::Make ("", "/var/log/b.log"), "state file name: two files in one directory have two state files");
+
+    /* What is not safe in a file name is replaced. The hash is of the real path, so two names which look the same after that stay apart */
+    std::string Odd    = FileStateName::Make ("/d", "/var/log/my app (1).log");
+    std::string Prefix = "/d/my_app__1_.log.";
+
+    Check ( (Odd.compare (0, Prefix.size(), Prefix) == 0) && (Odd.size() == Prefix.size() + 8 + Suffix.size()), "state file name: blanks and brackets in the file name become underscores");
+    Check (FileStateName::Make ("/d", "/x/a b.log") != FileStateName::Make ("/d", "/x/a_b.log"), "state file name: two names which look the same after that are still two names");
+
+    std::string Utf8   = FileStateName::Make ("/d", "/var/log/caf\xc3\xa9.log");
+    bool        bAscii = true;
+
+    for (char c : Utf8)
+    {
+        if (static_cast<unsigned char> (c) >= 0x80)
+            bAscii = false;
+    }
+
+    Check (bAscii, "state file name: bytes above 127 are replaced");
+
+    std::string Long   = FileStateName::Make ("/d", "/var/log/" + std::string (300, 'x') + ".log");
+
+    Check ( (Long.size() == 3 + 100 + 1 + 8 + Suffix.size()) && (Long.compare (3, 100, std::string (100, 'x')) == 0), "state file name: a long file name is cut at 100 characters");
+
+    std::string Empty  = FileStateName::Make ("/d", "/var/log/");
+
+    Check (Empty.compare (0, 8, "/d/file.") == 0, "state file name: a path without a file name gives \"file\"");
+    Check (FileStateName::Make ("/d", "app.log").compare (0, 11, "/d/app.log.") == 0, "state file name: a path without a directory works");
+}
+
+
+/* What the push thread hands over to the file thread */
+static void TestFileCommitSlot ()
+{
+    FileCommitSlot Slot;
+    uint64_t       Generation = 0;
+    uint64_t       EndOffset  = 0;
+
+    Check (false == Slot.Take (Generation, EndOffset), "commit slot: empty at the start");
+
+    Slot.Add (1, 100);
+    Check (Slot.Take (Generation, EndOffset) && (1 == Generation) && (100 == EndOffset), "commit slot: what was added is taken");
+    Check (false == Slot.Take (Generation, EndOffset), "commit slot: and it is gone after that");
+
+    Slot.Add (1, 100);
+    Slot.Add (1, 250);
+    Slot.Add (1, 180);
+    Check (Slot.Take (Generation, EndOffset) && (1 == Generation) && (250 == EndOffset), "commit slot: the highest position of a generation is kept");
+
+    Slot.Add (1, 500);
+    Slot.Add (2, 10);
+    Check (Slot.Take (Generation, EndOffset) && (2 == Generation) && (10 == EndOffset), "commit slot: a newer generation replaces an older one, also with a lower position");
+
+    Slot.Add (2, 20);
+    Slot.Add (1, 900);
+    Check (Slot.Take (Generation, EndOffset) && (2 == Generation) && (20 == EndOffset), "commit slot: an older generation than the current one is ignored");
+
+    Slot.Add (2, 20);
+    Slot.Add (2, 15);
+    Check (false == Slot.Take (Generation, EndOffset), "commit slot: a position which was taken already, or a lower one, is ignored after the take too");
+
+    Slot.Add (2, 30);
+    Check (Slot.Take (Generation, EndOffset) && (2 == Generation) && (30 == EndOffset), "commit slot: a higher position after a take is taken");
+
+    /* Several threads add, and the file thread takes: the highest position wins, and nothing is torn */
+    FileCommitSlot Shared;
+    std::atomic<bool> bStop {false};
+    uint64_t          Highest = 0;
+    bool              bAscending = true;
+
+    std::thread Taker ([&]
+    {
+        uint64_t G = 0, O = 0, Last = 0;
+
+        while (false == bStop.load())
+        {
+            if (Shared.Take (G, O))
+            {
+                if ( (1 != G) || (O < Last) )
+                    bAscending = false;
+
+                Last = O;
+            }
+        }
+
+        if (Shared.Take (G, O))
+        {
+            if ( (1 != G) || (O < Last) )
+                bAscending = false;
+
+            Last = O;
+        }
+
+        Highest = Last;
+    });
+
+    std::vector<std::thread> Adders;
+
+    for (uint64_t t = 0; t < 4; t++)
+    {
+        Adders.emplace_back ([&Shared, t]
+        {
+            for (uint64_t i = 1; i <= 10000; i++)
+                Shared.Add (1, i * 4 + t);
+        });
+    }
+
+    for (std::thread& Adder : Adders)
+        Adder.join();
+
+    bStop = true;
+    Taker.join();
+
+    Check (bAscending && (40003 == Highest), "commit slot: four threads adding while one takes: what is taken never goes back, and the highest position arrives");
+}
+
+
 int main ()
 {
     setvbuf (stdout, NULL, _IOLBF, 0);
@@ -900,6 +1074,11 @@ int main ()
     TestLogTime();
     TestLogLine();
     TestLogOutput();
+
+    Group ("File input: the severity, the names of the state files, and the hand over of the position");
+    TestFileSeverity();
+    TestFileStateName();
+    TestFileCommitSlot();
 
     if (false == g_FailedNames.empty())
     {
