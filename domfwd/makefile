@@ -25,11 +25,19 @@ INCDIR = $(LOTUS)/notesapi/include
 BOOTOBJS = $(LOTUS)/notesapi/lib/linux64/notes0.o $(LOTUS)/notesapi/lib/linux64/notesai0.o
 DEFINES = -DGCC3 -DGCC4 -fno-strict-aliasing -DGCC_LBLB_NOT_SUPPORTED -Wformat -Wall -Wcast-align -Wconversion  -DUNIX -DLINUX -DLINUX86 -DND64 -DLINUX64 -DW -DLINUX86_64 -DDTRACE -DPTHREAD_KERNEL -D_REENTRANT -DUSE_THREADSAFE_INTERFACES -D_POSIX_THREAD_SAFE_FUNCTIONS  -DHANDLE_IS_32BITS -DHAS_IOCP -DHAS_BOOL -DHAS_DLOPEN -DUSE_PTHREAD_INTERFACES -DLARGE64_FILES -D_LARGEFILE_SOURCE -D_LARGEFILE64_SOURCE -DNDUNIX64 -DLONGIS64BIT -DPRODUCTION_VERSION -DOVERRIDEDEBUG -fPIC -Wno-write-strings $(CURL_DEFINE)
 
-$(TARGET): $(OBJECT)
-	$(CC) $(OBJECT) $(BOOTOBJS) -L$(NOTESDIR) -Wl,-rpath-link -no-pie $(NOTESDIR) $(LIBS) -o $(TARGET)
+# The WAL (DOMFWD_SocketWAL) is a module of its own, see ../wal/README.md. Linux only. It needs none of the Domino headers or
+# defines, so it is compiled by itself. It uses threads: -lpthread is in LIBS
+WALDIR    = ../wal
+WALOBJECT = simple_wal.o
 
-$(OBJECT): $(SOURCE) domfwd_socket.hpp
-	$(CC) $(CCOPTS) $(DEFINES) -I$(INCDIR) $(SOURCE) -o $(OBJECT)
+$(TARGET): $(OBJECT) $(WALOBJECT)
+	$(CC) $(OBJECT) $(WALOBJECT) $(BOOTOBJS) -L$(NOTESDIR) -Wl,-rpath-link -no-pie $(NOTESDIR) $(LIBS) -o $(TARGET)
+
+$(OBJECT): $(SOURCE) domfwd_socket.hpp domfwd_durable.hpp $(WALDIR)/simple_wal.hpp
+	$(CC) $(CCOPTS) $(DEFINES) -I$(INCDIR) -I$(WALDIR) $(SOURCE) -o $(OBJECT)
+
+$(WALOBJECT): $(WALDIR)/simple_wal.cpp $(WALDIR)/simple_wal.hpp
+	$(CC) $(CCOPTS) -std=c++11 -fPIC -Wall -Wextra -I$(WALDIR) $(WALDIR)/simple_wal.cpp -o $(WALOBJECT)
 
 install: $(TARGET) 
 	cp -f $(TARGET) /opt/hcl/domino/notes/latest/linux/$(PROGRAM)

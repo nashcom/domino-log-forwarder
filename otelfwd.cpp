@@ -37,6 +37,10 @@
 #define OTELFWD_DEFAULT_WAL_RETRY_SEC         60
 #define OTELFWD_MAX_WAL_RETRY_SEC             86400
 
+/* The largest size of the WAL in MB. Pushes which do not fit are dropped. 0 is no limit */
+#define OTELFWD_DEFAULT_WAL_MAX_MB            128
+#define OTELFWD_MAX_WAL_MAX_MB                1048576
+
 /* A receiver which does not accept the connection in this time is treated as not reachable */
 #define OTELFWD_PUSH_CONNECT_TIMEOUT_SEC      3
 
@@ -293,6 +297,7 @@ char g_szEnvOtlpPushApiUrl[]         = "OTLP_PUSH_API_URL";
 char g_szEnvOtlpPushApiUrlBackup[]   = "OTLP_PUSH_API_URL_BACKUP";
 char g_szEnvOtlpPushFailbackSec[]    = "OTLP_PUSH_FAILBACK_SEC";
 char g_szEnvOtlpPushWalRetrySec[]    = "OTLP_PUSH_WAL_RETRY_SEC";
+char g_szEnvOtlpPushWalMaxMB[]       = "OTLP_PUSH_WAL_MAX_MB";
 char g_szEnvOtlpPushEncoding[]       = "OTLP_PUSH_ENCODING";
 char g_szEnvOtlpPushToken[]          = "OTLP_PUSH_TOKEN";
 char g_szEnvOtlpCaFile[]             = "OTLP_CA_FILE";
@@ -308,6 +313,7 @@ char g_szOtlpPushApiURL[1024]    = {0};
 char g_szOtlpPushApiURLBackup[1024] = {0};   /* optional second endpoint, used when the primary fails */
 size_t g_FailbackSec             = OTELFWD_DEFAULT_FAILBACK_SEC;
 size_t g_WalRetrySec             = OTELFWD_DEFAULT_WAL_RETRY_SEC;
+size_t g_WalMaxMB                = OTELFWD_DEFAULT_WAL_MAX_MB;
 bool   g_bPushProtobuf           = false;   /* the format of push requests: false is JSON, true is protobuf */
 char g_szOtlpPushToken[1024]     = {0};
 char g_szOtlpCaFile[1024]        = {0};
@@ -1329,6 +1335,20 @@ static bool ParseSecondsSetting (const char *pszValue, long MaxValue, size_t& re
         return false;
 
     retSeconds = static_cast<size_t> (Value);
+    return true;
+}
+
+
+/* A number of MB from 0 to MaxValue, and nothing else after the number. 0 is no limit. Returns false for any other text */
+static bool ParseMegabytesSetting (const char *pszValue, long MaxValue, size_t& retMegabytes)
+{
+    char *pEnd  = NULL;
+    long  Value = strtol (pszValue, &pEnd, 10);
+
+    if ( (pEnd == pszValue) || ('\0' != *pEnd) || (Value < 0) || (Value > MaxValue) )
+        return false;
+
+    retMegabytes = static_cast<size_t> (Value);
     return true;
 }
 
@@ -2788,6 +2808,11 @@ void LogStartupSummary (bool bWalOpened)
                 LogSetting ("WAL Pending", std::to_string (static_cast<long long> (WalStat.st_size)) + " bytes of an earlier run, will be replayed");
 
             LogSetting ("OTLP Push WAL Retry sec", std::to_string (static_cast<unsigned long> (g_WalRetrySec)));
+
+            if (0 == g_WalMaxMB)
+                LogSetting ("OTLP Push WAL Max MB", "0 (no limit)");
+            else
+                LogSetting ("OTLP Push WAL Max MB", std::to_string (static_cast<unsigned long> (g_WalMaxMB)));
         }
         else
         {
@@ -2843,6 +2868,25 @@ void ValidateWalRetryConfig()
     {
         snprintf (szMessage, sizeof (szMessage), "%s has to be a number of seconds from 1 to %d. Using the default of %d seconds",
                   g_szEnvOtlpPushWalRetrySec, OTELFWD_MAX_WAL_RETRY_SEC, OTELFWD_DEFAULT_WAL_RETRY_SEC);
+        LogError (szMessage, pValue);
+    }
+}
+
+
+/* Checks OTLP_PUSH_WAL_MAX_MB at start. The value was read before (see main): an invalid one is reported, and the default is used */
+void ValidateWalMaxConfig()
+{
+    const char *pValue = getenv (g_szEnvOtlpPushWalMaxMB);
+    size_t      Megabytes = 0;
+    char        szMessage[300] = {0};
+
+    if ( (NULL == pValue) || ('\0' == *pValue) )
+        return;
+
+    if (false == ParseMegabytesSetting (pValue, OTELFWD_MAX_WAL_MAX_MB, Megabytes))
+    {
+        snprintf (szMessage, sizeof (szMessage), "%s has to be a number of MB from 0 (no limit) to %d. Using the default of %d MB",
+                  g_szEnvOtlpPushWalMaxMB, OTELFWD_MAX_WAL_MAX_MB, OTELFWD_DEFAULT_WAL_MAX_MB);
         LogError (szMessage, pValue);
     }
 }
@@ -3014,6 +3058,7 @@ void PrintHelp ()
     LogHelpEnv (g_szEnvOtlpPushApiUrlBackup,  "Optional backup OTLP/HTTP logs push URL, used when the push URL fails. Same token and CA file");
     LogHelpEnv (g_szEnvOtlpPushFailbackSec,   "Seconds between attempts to use the push URL again while the backup is in use (default: 60 sec)");
     LogHelpEnv (g_szEnvOtlpPushWalRetrySec,   "Seconds to wait before the WAL is sent again after the receiver did not accept it (default: 60 sec)");
+    LogHelpEnv (g_szEnvOtlpPushWalMaxMB,      "Largest size of the WAL in MB. Pushes which do not fit are dropped. 0 is no limit (default: 128 MB)");
     LogHelpEnv (g_szEnvOtlpPushEncoding,     "Format of the push requests: json or protobuf (default: json). Use protobuf for receivers which do not take JSON, like VictoriaLogs. The WAL is JSON either way");
     LogHelpEnv (g_szEnvOtlpPushToken,         "OTLP Push Token (bearer token)");
     LogHelpEnv (g_szEnvOtlpCaFile,            "OTLP Trusted Root CA File");
@@ -3115,6 +3160,7 @@ void DumpConfig (bool bShowEnvVars = false)
     LogCfgText (bShowEnvVars, "OTLP Push API URL Backup", SanitizeUrlForLog (g_szOtlpPushApiURLBackup).c_str(), g_szEnvOtlpPushApiUrlBackup);
     LogCfgNum  (bShowEnvVars, "OTLP Push Failback sec",  g_FailbackSec,        g_szEnvOtlpPushFailbackSec);
     LogCfgNum  (bShowEnvVars, "OTLP Push WAL Retry sec", g_WalRetrySec,        g_szEnvOtlpPushWalRetrySec);
+    LogCfgNum  (bShowEnvVars, "OTLP Push WAL Max MB",    g_WalMaxMB,           g_szEnvOtlpPushWalMaxMB);
     LogCfgText (bShowEnvVars, "OTLP Push Encoding",     GetPushEncodingName(), g_szEnvOtlpPushEncoding);
     LogCfgText (bShowEnvVars, "OTLP Push Token",         g_szOtlpPushToken[0] ? "(set)" : "", g_szEnvOtlpPushToken);
     LogCfgText (bShowEnvVars, "OTLP CA File",            g_szOtlpCaFile,       g_szEnvOtlpCaFile);
@@ -3277,6 +3323,11 @@ int main (int argc, char *argv[])
     if (p && *p)
         ParseSecondsSetting (p, OTELFWD_MAX_WAL_RETRY_SEC, g_WalRetrySec);
 
+    /* An invalid value is reported at start (ValidateWalMaxConfig) and the default is used */
+    p = getenv (g_szEnvOtlpPushWalMaxMB);
+    if (p && *p)
+        ParseMegabytesSetting (p, OTELFWD_MAX_WAL_MAX_MB, g_WalMaxMB);
+
     /* An invalid value is reported at start (ValidatePushEncoding) and json is used */
     p = getenv (g_szEnvOtlpPushEncoding);
     if (p && *p)
@@ -3388,6 +3439,7 @@ int main (int argc, char *argv[])
 
     ValidatePushEncoding();
     ValidateWalRetryConfig();
+    ValidateWalMaxConfig();
     ValidateBackupConfig();
 
     /* The backup is only used if it is configured, and it is checked above: an invalid one was removed */
@@ -3410,6 +3462,7 @@ int main (int argc, char *argv[])
 
     /* The messages of the WAL ("[Error] WAL: ...") are lines of the console output of otelfwd: with the time and the process name */
     g_Wal.SetLogFunction ([] (const char *pszMessage) { LogMessage (pszMessage); });
+    g_Wal.SetMaxSize (static_cast<uint64_t> (g_WalMaxMB) * 1024 * 1024);
 
     if (*g_szOtlpPushApiURL)
         g_bWalOpened = g_Wal.Init (g_szWalFile);

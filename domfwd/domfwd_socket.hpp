@@ -211,6 +211,57 @@ public:
         return true;
     }
 
+    /* True if a line of this length fits into the queue now. This is the check which Enqueue() makes: apart from an invalid line it
+       only refuses a line for this reason */
+    bool HasRoom (size_t Len) const
+    {
+        return m_bConfigured && (m_Lines < m_MaxLines) && (((m_Tail - m_Head) + Len + 1) <= m_MaxBytes);
+    }
+
+    /* The oldest line which was not sent completely, without the new line. It stays in the queue. For a program which moves the
+       lines elsewhere, for example into a file at shutdown. A line which was sent only in part counts as not sent: it would be
+       sent again in full on the next connection. Returns false if there is none */
+    bool PeekUnsent (const char **ppLine, size_t *pLen) const
+    {
+        const char *pNewLine = NULL;
+
+        if ( (false == m_bConfigured) || (0 == m_Lines) || (NULL == ppLine) || (NULL == pLen) )
+            return false;
+
+        pNewLine = (const char *) memchr (m_pBuffer + m_Head, '\n', m_Tail - m_Head);
+
+        if (NULL == pNewLine)
+            return false;
+
+        *ppLine = m_pBuffer + m_Head;
+        *pLen   = (size_t) (pNewLine - (m_pBuffer + m_Head));
+
+        return true;
+    }
+
+    /* Removes the line which PeekUnsent() returned. It is not counted as sent, dropped or rejected: the caller has it now */
+    void DropUnsent()
+    {
+        const char *pNewLine = NULL;
+
+        if ( (false == m_bConfigured) || (0 == m_Lines) )
+            return;
+
+        pNewLine = (const char *) memchr (m_pBuffer + m_Head, '\n', m_Tail - m_Head);
+
+        if (NULL == pNewLine)
+            return;
+
+        m_Head = (size_t) (pNewLine - m_pBuffer) + 1;
+        m_Lines--;
+
+        if (m_SendPos < m_Head)
+            m_SendPos = m_Head;
+
+        if (m_Head == m_Tail)
+            m_Head = m_SendPos = m_Tail = 0;
+    }
+
     /* Does what can be done without waiting: connect, detect a closed connection, send queued lines */
     void Pump()
     {

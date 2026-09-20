@@ -242,6 +242,7 @@ The URL is the complete logs endpoint of the receiver. For the OpenTelemetry Col
 | `OTLP_PUSH_API_URL_BACKUP` | Optional backup endpoint, see below                             | `https://otel-b.example.com:4318/v1/logs` |
 | `OTLP_PUSH_FAILBACK_SEC`   | Seconds between tries of the primary while the backup is in use | default: `60`                             |
 | `OTLP_PUSH_WAL_RETRY_SEC`  | Seconds to wait before the WAL is sent again after a failure    | default: `60`, see below                  |
+| `OTLP_PUSH_WAL_MAX_MB`     | Largest size of the WAL in MB, 0 is no limit                    | default: `128`, see below                 |
 | `OTLP_PUSH_TOKEN`          | Bearer token for the endpoint                                   | `my-secure-token`                         |
 | `OTLP_CA_FILE`             | Trusted Root CA File                                            | `/local/notesdata/trusted_root.pem`       |
 | `OTLP_SERVICE_NAME`        | `service.name` resource attribute                               | default: `domino`                         |
@@ -334,6 +335,8 @@ One WAL record is one push request, which can contain multiple log lines.
 The WAL file is `otelfwd.wal` in the data directory (`OTELFWD_DATA_DIR`).
 
 **When the WAL is sent.** The WAL is checked every second. If the receiver does not accept a record, the replay stops there. `otelfwd` logs `Cannot send the WAL to the receiver. Trying again in 60 seconds` and waits `OTLP_PUSH_WAL_RETRY_SEC` seconds (default 60, from 1 to 86400, up to a second more in practice) before the next try. An invalid value is reported at start and 60 is used. The value in use is in the log at start and in `-cfg`.
+
+**How large the WAL can get.** `OTLP_PUSH_WAL_MAX_MB` (default 128, from 0 to 1048576) is the largest size of the WAL file. A record which does not fit is not stored: that push is dropped, and there is one warning in the log until a record was stored again. The file only gets smaller when the WAL is emptied, and a WAL of an earlier run which is larger than the limit is still sent, but takes no new records until it is empty. `0` is no limit: the WAL grows until the disk is full. An invalid value is reported at start and 128 is used. The value in use is in the log at start and in `-cfg`.
 
 * Records are sent in the order they were written. The position of the last accepted record is saved when a replay stops, so the next try continues there. When every record was sent, the WAL is emptied. Delivery is at least once: after a crash a record can be sent twice.
 * New log lines do not wait for the WAL. They are pushed at once, so after an outage they can arrive before the older lines, which keep their original time.
@@ -493,12 +496,13 @@ Both scripts print how many lines were pushed and return an error if the push fa
 
 ## Testing
 
-| Test                     | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                                                    |
-| :----------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| WAL unit test            | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, use from several threads, one record at a time (Peek and Ack), the size limit, its messages, speed ([details](wal/README.md#the-tests))  |
-| Unit test of otelfwd     | `make test`                                                                                      | a C++ compiler and `make` | The failover between two OTLP endpoints (backup, failback timing, refused data, threads), the converter from JSON to protobuf, and the format of the log lines ([details](#unit-test-of-otelfwd)) |
-| Load test                | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                                         |
-| Load test with an outage | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                    | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end))                        |
+| Test                     | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                                                                                            |
+| :----------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| WAL unit test            | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, use from several threads, one record at a time (Peek and Ack), the size limit, its messages, speed ([details](wal/README.md#the-tests))                                          |
+| Unit test of otelfwd     | `make test`                                                                                      | a C++ compiler and `make` | The failover between two OTLP endpoints (backup, failback timing, refused data, threads), the converter from JSON to protobuf, and the format of the log lines ([details](#unit-test-of-otelfwd))                                         |
+| Durable sender test      | `make test`                                                                                      | a C++ compiler and `make` | The socket sender of `domfwd` together with the WAL: lines wait on disk while the receiver is down, arrive in order when it is back, survive a restart and the end of the program ([details](#unit-test-of-the-durable-sender-of-domfwd)) |
+| Load test                | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                                                                                 |
+| Load test with an outage | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                    | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end))                                                                |
 
 `--yes` in the commands of `run_loadtest.sh` means: do not ask for the size of the test. Without it, the script asks in a terminal for the number of threads and requests, and Enter takes the default (8 threads with 10,000 requests each). `./nginx/run_loadtest.sh --help` lists all options of the script and of the load test program.
 
@@ -522,6 +526,16 @@ It checks: no backup, a working primary, the failover and that the backup stays 
 * What must be refused: broken JSON, more than one JSON value, a member or a type of value which the converter does not know, a value with two types, wrong types, and numbers which are out of range. An error returns no bytes, and the error text names the member.
 
 **The log lines** (`log_line.hpp`): the console output of `otelfwd`. The time is UTC in ISO 8601, then two blanks, the process name (in pipe mode), the level, the message and a text. The expected times are what the `date` command says for the same number of seconds, also when the host time zone is 12 hours ahead. The lines are written to stderr in one piece, and without a process name with `-nostdin`.
+
+### Unit test of the durable sender of domfwd
+
+`domfwd/domfwd_durable_test.cpp` tests `domfwd/domfwd_durable.hpp`: the socket sender of `domfwd` together with the [WAL](wal/README.md). It is also the test of the socket sender. The test starts a small server of its own on a UNIX socket. The server can be stopped and started again, which is what happens to `otelfwd`, and it can stop reading, which fills the socket. There is no Domino and no `otelfwd`. `make test` builds and runs it, or directly:
+
+```bash
+./domfwd_durable_test
+```
+
+It checks: a receiver which is there (the fast path, the WAL is not used), a receiver which is not there (the lines wait in the WAL and not in memory, and arrive in order when it is back), that a new line never overtakes lines which wait in the WAL, that one `Pump` moves only a bounded number of lines, a queue which is smaller than the low water mark, the end of the program (what is in memory goes to the WAL, and is sent at the next start), a full WAL (refused lines are counted), lines which are not valid, a record with a new line inside in a WAL which somebody else wrote, no WAL at all, and a WAL which cannot be opened. It also checks that `HasRoom()` of the sender always says what `Enqueue()` does, and the functions which take the unsent lines out of the queue.
 
 ### Test receiver and load test
 

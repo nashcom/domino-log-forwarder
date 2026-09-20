@@ -3,6 +3,7 @@
 /otel-sink
 /loadtest
 /otelfwd_unit_test
+/domfwd_durable_test
 
 # The WAL module: sample and tests
 /wal/wal_sample

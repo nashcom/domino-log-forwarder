@@ -4,7 +4,7 @@ LDFLAGS  = -lcurl
 
 # Targets
 TARGET  = otelfwd
-TARGET_TEST = otelfwd_unit_test
+TARGET_TEST = otelfwd_unit_test domfwd_durable_test
 
 # The WAL is a module of its own, with its sample, its tests and its README: see wal/README.md
 WAL_DIR  = wal
@@ -39,6 +39,11 @@ otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(PUSH_HDR) $(LOG_HDR)
 # Needs the rapidjson headers
 otelfwd_unit_test: otelfwd_unit_test.cpp $(PUSH_HDR) $(LOG_HDR)
 	$(CXX) $(CXXFLAGS) -pthread -o $@ otelfwd_unit_test.cpp
+
+# Unit test of the durable line sender of domfwd: the socket sender and the WAL together. It starts a small server of its own on
+# a UNIX socket. No Domino, no otelfwd
+domfwd_durable_test: domfwd/domfwd_durable_test.cpp domfwd/domfwd_durable.hpp domfwd/domfwd_socket.hpp $(WAL_SRC) $(WAL_HDR)
+	$(CXX) $(CXXFLAGS) -pthread -Idomfwd -I$(WAL_DIR) -o $@ domfwd/domfwd_durable_test.cpp $(WAL_SRC)
 
 # Test tool: receiving end of the OTLP test container, see tools/otel-sink/. Not part of "all".
 #   make otel-sink                needs rapidjson and zlib headers

@@ -62,7 +62,7 @@
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
-#include "domfwd_socket.hpp"
+#include "domfwd_durable.hpp"
 
 #include <stdarg.h>
 #include <time.h>
@@ -132,14 +132,17 @@ char  g_szOtelPushToken[512]               = {0};
 char  g_szOtelCaFile[512]                  = {0};
 DWORD g_dwOwnProcessId                     = 0;
 char  g_szSocketTarget[512]                = {0};
+char  g_szSocketWal[512]                   = {0};
 
 /* Socket transport to the forwarder (pipe tool). notes.ini: DOMFWD_Socket=unix:/path/to/socket (Linux)
-   or DOMFWD_Socket=tcp:127.0.0.1:4390. Events wait in a bounded queue when the forwarder is not reachable. */
-DomfwdSocketSender g_SocketSender;
+   or DOMFWD_Socket=tcp:127.0.0.1:4390. Events wait in a bounded queue in memory when the forwarder is connected and slow, and in a WAL
+   on disk (DOMFWD_SocketWAL, Linux) when it is not reachable: see domfwd_durable.hpp. */
+DomfwdDurableSender g_SocketSender;
 
-#define DOMFWD_SOCKET_MAX_LINES 2000
-#define DOMFWD_SOCKET_MAX_BYTES (4 * 1024 * 1024)
-#define DOMFWD_SOCKET_FLUSH_MS  2000
+#define DOMFWD_SOCKET_MAX_LINES      2000
+#define DOMFWD_SOCKET_MAX_BYTES      (4 * 1024 * 1024)
+#define DOMFWD_SOCKET_FLUSH_MS       2000
+#define DOMFWD_SOCKET_WAL_DEFAULT_MB 128
 
 #define DOMFWD_TASKNAME "DOMFWD"
 #define DOMFWD_MQ_NAME  TASK_QUEUE_PREFIX DOMFWD_TASKNAME
@@ -1306,10 +1309,14 @@ void SocketLog (const char *pszMessage)
 }
 
 
-/* Reads DOMFWD_Socket from notes.ini once at startup and prepares the sender. It connects later in the main loop. */
+/* Reads DOMFWD_Socket, DOMFWD_SocketWAL and DOMFWD_SocketWALMaxMB from notes.ini once at startup and prepares the sender. It
+   connects later in the main loop. The WAL is only used on Linux: on Windows a setting is reported, and events wait in memory only. */
 void LoadSocketConfig (void)
 {
-    char szError[256] = {0};
+    char     szError[256]   = {0};
+    char     szMessage[600] = {0};
+    long     WalMaxMB       = 0;
+    uint64_t WalMaxBytes    = 0;
 
     OSGetEnvironmentString ("DOMFWD_Socket", g_szSocketTarget, sizeof (g_szSocketTarget) - 1);
 
@@ -1333,36 +1340,95 @@ void LoadSocketConfig (void)
     if ('\0' == g_szSocketTarget[0])
         return;
 
-    if (g_SocketSender.Configure (g_szSocketTarget, SocketLog, DOMFWD_SOCKET_MAX_LINES, DOMFWD_SOCKET_MAX_BYTES, szError, sizeof (szError)))
+    /* The WAL: events wait on disk while the forwarder is not reachable, also when this program or the server stops.
+       DOMFWD_SocketWAL=off switches it off. Default on Linux: <data>/domino/domfwd.wal */
+    OSGetEnvironmentString ("DOMFWD_SocketWAL", g_szSocketWal, sizeof (g_szSocketWal) - 1);
+
+    if (0 == strcmp (g_szSocketWal, "off"))
+    {
+        g_szSocketWal[0] = '\0';
+    }
+#if !defined (_WIN32)
+    else if ('\0' == g_szSocketWal[0])
+    {
+        char szDataDir[MAXPATH + 1]    = {0};
+        char szDominoDir[MAXPATH + 16] = {0};
+
+        OSGetDataDirectory (szDataDir);
+        snprintf (szDominoDir, sizeof (szDominoDir), "%s/domino", szDataDir);
+        EnsureDirectoryExists (szDominoDir);
+        snprintf (g_szSocketWal, sizeof (g_szSocketWal), "%s/domfwd.wal", szDominoDir);
+    }
+#endif
+
+    /* The largest size of the WAL. Not set or 0: the default. An event record is about 1 KB: 128 MB are roughly 150,000 events */
+    WalMaxMB = (long) OSGetEnvironmentInt ("DOMFWD_SocketWALMaxMB");
+
+    if (WalMaxMB <= 0)
+        WalMaxMB = DOMFWD_SOCKET_WAL_DEFAULT_MB;
+
+    WalMaxBytes = (uint64_t) WalMaxMB * 1024 * 1024;
+
+    if (g_SocketSender.Configure (g_szSocketTarget, SocketLog, DOMFWD_SOCKET_MAX_LINES, DOMFWD_SOCKET_MAX_BYTES, g_szSocketWal, WalMaxBytes, szError, sizeof (szError)))
+    {
         AddInLogMessageText ("%s: Forwarding events to %s", 0, g_szTask, g_szSocketTarget);
+
+        if (g_SocketSender.HasWal ())
+        {
+            snprintf (szMessage, sizeof (szMessage), "Events wait in the WAL %s (at most %ld MB) while the forwarder is not reachable", g_szSocketWal, WalMaxMB);
+            AddInLogMessageText ("%s: Socket: %s", 0, g_szTask, szMessage);
+
+            if (g_SocketSender.GetWalSize () > 0)
+            {
+                snprintf (szMessage, sizeof (szMessage), "The WAL holds %lu bytes of events of an earlier run. They are sent when the forwarder is reachable", (unsigned long) g_SocketSender.GetWalSize ());
+                AddInLogMessageText ("%s: Socket: %s", 0, g_szTask, szMessage);
+            }
+        }
+    }
     else
+    {
         AddInLogMessageText ("%s: Invalid DOMFWD_Socket setting \"%s\": %s", 0, g_szTask, g_szSocketTarget, szError);
+    }
 }
 
 
-/* Never blocks: the line is queued and sent as far as the connection allows right now */
+/* Never blocks: the line is queued, or written to the WAL if the forwarder is not there, and sent as far as the connection allows
+   right now */
 void SendEventToSocket (const rapidjson::StringBuffer *pPayloadBuffer)
 {
     if (false == g_SocketSender.IsConfigured ())
         return;
 
-    g_SocketSender.Enqueue (pPayloadBuffer->GetString (), pPayloadBuffer->GetSize ());
+    g_SocketSender.Send (pPayloadBuffer->GetString (), pPayloadBuffer->GetSize ());
     g_SocketSender.Pump ();
 }
 
 
-/* At shutdown: gives the queue a moment to drain, logs what happened and closes the connection */
+/* At shutdown: gives the queue a moment to drain. What could not be sent goes to the WAL. Logs what happened and closes the connection */
 void ShutdownSocket (void)
 {
-    char szStats[256] = {0};
+    char szStats[320] = {0};
 
     if (false == g_SocketSender.IsConfigured ())
         return;
 
     if (false == g_SocketSender.Flush (DOMFWD_SOCKET_FLUSH_MS))
-        AddInLogMessageText ("%s: Socket: %u events could not be delivered to the forwarder", 0, g_szTask, (unsigned) g_SocketSender.GetQueuedLines ());
+        AddInLogMessageText ("%s: Socket: %u events could not be delivered to the forwarder%s", 0, g_szTask, (unsigned) g_SocketSender.GetQueuedLines (),
+                             g_SocketSender.HasWal () ? " and could not be stored in the WAL" : "");
 
-    snprintf (szStats, sizeof (szStats), "%lu sent, %lu dropped", (unsigned long) g_SocketSender.GetSent (), (unsigned long) g_SocketSender.GetDropped ());
+    if (g_SocketSender.HasWal () && (g_SocketSender.GetWalSize () > 0))
+    {
+        snprintf (szStats, sizeof (szStats), "%lu bytes of events wait in the WAL for the next start", (unsigned long) g_SocketSender.GetWalSize ());
+        AddInLogMessageText ("%s: Socket: %s", 0, g_szTask, szStats);
+    }
+
+    if (g_SocketSender.HasWal ())
+        snprintf (szStats, sizeof (szStats), "%lu sent, %lu dropped, %lu written to the WAL, %lu taken from it",
+                  (unsigned long) g_SocketSender.GetSent (), (unsigned long) g_SocketSender.GetDropped (),
+                  (unsigned long) g_SocketSender.GetSpilled (), (unsigned long) g_SocketSender.GetDrained ());
+    else
+        snprintf (szStats, sizeof (szStats), "%lu sent, %lu dropped", (unsigned long) g_SocketSender.GetSent (), (unsigned long) g_SocketSender.GetDropped ());
+
     AddInLogMessageText ("%s: Socket: %s", 0, g_szTask, szStats);
 
     g_SocketSender.Close ();
@@ -1453,7 +1519,7 @@ void WritePromFile (void)
         fprintf (pFile, "# TYPE domfwd_socket_sent_total counter\n");
         fprintf (pFile, "domfwd_socket_sent_total %llu\n", (unsigned long long) g_SocketSender.GetSent ());
 
-        fprintf (pFile, "# HELP domfwd_socket_dropped_total Records dropped because the queue was full\n");
+        fprintf (pFile, "# HELP domfwd_socket_dropped_total Records dropped because the queue was full, and the WAL too (or there is none)\n");
         fprintf (pFile, "# TYPE domfwd_socket_dropped_total counter\n");
         fprintf (pFile, "domfwd_socket_dropped_total %llu\n", (unsigned long long) g_SocketSender.GetDropped ());
 
@@ -1472,6 +1538,26 @@ void WritePromFile (void)
         fprintf (pFile, "# HELP domfwd_socket_connected 1 if connected to the forwarder\n");
         fprintf (pFile, "# TYPE domfwd_socket_connected gauge\n");
         fprintf (pFile, "domfwd_socket_connected %d\n", g_SocketSender.IsConnected () ? 1 : 0);
+
+        /* Only with a WAL */
+        if (g_SocketSender.HasWal ())
+        {
+            fprintf (pFile, "# HELP domfwd_socket_wal_bytes Size of the WAL: events which wait on disk for the forwarder\n");
+            fprintf (pFile, "# TYPE domfwd_socket_wal_bytes gauge\n");
+            fprintf (pFile, "domfwd_socket_wal_bytes %llu\n", (unsigned long long) g_SocketSender.GetWalSize ());
+
+            fprintf (pFile, "# HELP domfwd_socket_wal_written_total Records written to the WAL because the forwarder was not connected or records waited\n");
+            fprintf (pFile, "# TYPE domfwd_socket_wal_written_total counter\n");
+            fprintf (pFile, "domfwd_socket_wal_written_total %llu\n", (unsigned long long) g_SocketSender.GetSpilled ());
+
+            fprintf (pFile, "# HELP domfwd_socket_wal_taken_total Records taken out of the WAL and given to the sender\n");
+            fprintf (pFile, "# TYPE domfwd_socket_wal_taken_total counter\n");
+            fprintf (pFile, "domfwd_socket_wal_taken_total %llu\n", (unsigned long long) g_SocketSender.GetDrained ());
+
+            fprintf (pFile, "# HELP domfwd_socket_wal_refused_total Records which the WAL did not take (it was full, or a failure). They are dropped\n");
+            fprintf (pFile, "# TYPE domfwd_socket_wal_refused_total counter\n");
+            fprintf (pFile, "domfwd_socket_wal_refused_total %llu\n", (unsigned long long) g_SocketSender.GetWalRefused ());
+        }
     }
 
     fclose (pFile);
@@ -1556,9 +1642,10 @@ STATUS ProcessEventData (DHANDLE hEventData)
         /* Socket first: it never blocks. The direct push below waits for the server (up to its timeout) */
         SendEventToSocket (&PayloadBuffer);
 
-        DOMFWD_TRACE ("event queued: %u bytes, connected=%d queued=%u sent=%lu dropped=%lu rejected=%lu",
+        DOMFWD_TRACE ("event queued: %u bytes, connected=%d queued=%u sent=%lu dropped=%lu rejected=%lu wal written=%lu taken=%lu",
                       (unsigned) PayloadBuffer.GetSize (), (int) g_SocketSender.IsConnected (), (unsigned) g_SocketSender.GetQueuedLines (),
-                      (unsigned long) g_SocketSender.GetSent (), (unsigned long) g_SocketSender.GetDropped (), (unsigned long) g_SocketSender.GetRejected ());
+                      (unsigned long) g_SocketSender.GetSent (), (unsigned long) g_SocketSender.GetDropped (), (unsigned long) g_SocketSender.GetRejected (),
+                      (unsigned long) g_SocketSender.GetSpilled (), (unsigned long) g_SocketSender.GetDrained ());
 
 #ifdef DOMFWD_CURL
         PushEventToOtel (&OtelFields, &PayloadBuffer);
