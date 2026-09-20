@@ -111,6 +111,7 @@
 #include "push_failover.hpp"
 #include "otlp_protobuf.hpp"
 #include "log_line.hpp"
+#include "health.hpp"
 
 /* pid.nbf map definition */
 using PidMap = std::unordered_map<pid_t, std::string>;
@@ -382,7 +383,10 @@ log_fifo g_LogFifo;
 
 /* WAL implementation. Only used when OTLP push is configured */
 SimpleWAL g_Wal;
-bool g_bWalOpened = false;      /* the result of opening it. Only used for the summary at start */
+bool g_bWalOpened = false;      /* the result of opening it. Only used for the summary at start, and for the health */
+
+/* The health state for alerting (see health.hpp). Only the metrics thread updates it */
+HealthMonitor g_Health;
 
 /* Which OTLP endpoint gets a push request: the primary, or the backup while the primary fails. Used by the push thread
    and by the thread which replays the WAL */
@@ -400,6 +404,7 @@ std::atomic<std::int64_t> g_Metric_PushErrors       {0};
 std::atomic<std::int64_t> g_Metric_PushRetrySuccess {0};
 std::atomic<std::int64_t> g_Metric_PushRetryErrors  {0};
 std::atomic<std::int64_t> g_Metric_PushRejected     {0};   /* push requests which are dropped for good: the receiver refused them as bad data (HTTP 400), or they cannot be converted to protobuf */
+std::atomic<std::int64_t> g_Metric_WalRefused       {0};   /* push requests which the WAL did not take (it was full, or a failure). They are lost */
 std::atomic<std::int64_t> g_Metric_PushConvertErrors {0};  /* the part of them which could not be converted to protobuf (only with OTLP_PUSH_ENCODING=protobuf) */
 
 /* Helper functions */
@@ -1252,7 +1257,11 @@ bool GetHostname (size_t MaxSize, char * retpszHostname)
 
 bool SendPayloadToWAL (const std::string& payload)
 {
-    return g_Wal.Append (payload.c_str(), payload.size());
+    if (g_Wal.Append (payload.c_str(), payload.size()))
+        return true;
+
+    g_Metric_WalRefused.fetch_add (1, std::memory_order_relaxed);
+    return false;
 }
 
 
@@ -2586,6 +2595,37 @@ void WriteIngestConnectionMetrics (FILE *fp, IngestSource *pSource)
 }
 
 
+/* Health for alerting: gives what is known now to the monitor, see health.hpp. Called by the metrics thread */
+void UpdateHealth()
+{
+    static int64_t Success   = 0;
+    static int64_t Errors    = 0;
+    static bool    bFailing  = false;
+
+    HealthInput Input;
+    int64_t     NewSuccess = g_Metric_PushSuccess.load (std::memory_order_relaxed) + g_Metric_PushRetrySuccess.load (std::memory_order_relaxed);
+    int64_t     NewErrors  = g_Metric_PushErrors.load  (std::memory_order_relaxed) + g_Metric_PushRetryErrors.load  (std::memory_order_relaxed);
+
+    /* Without a push nothing is known: the last result stays. A push which was accepted ends the failure, also when others failed */
+    if (NewSuccess > Success)
+        bFailing = false;
+    else if (NewErrors > Errors)
+        bFailing = true;
+
+    Success = NewSuccess;
+    Errors  = NewErrors;
+
+    Input.bUnreachable = bFailing;
+    Input.bWalFailed   = (false == IsNullStr (g_szOtlpPushApiURL)) && (false == g_bWalOpened);
+    Input.WalBytes     = g_bWalOpened ? g_Wal.GetSize() : 0;
+    Input.WalMaxBytes  = static_cast<uint64_t> (g_WalMaxMB) * 1024 * 1024;
+    Input.Dropped      = static_cast<uint64_t> (g_Metric_WalRefused.load (std::memory_order_relaxed));
+    Input.Rejected     = static_cast<uint64_t> (g_Metric_PushRejected.load (std::memory_order_relaxed));
+
+    g_Health.Update (time (NULL), Input, [] (const char *pszMessage) { LogMessage (pszMessage); });
+}
+
+
 bool WriteMetrics (bool bShutdown = false)
 {
     char    szTempFilename[2200] = {0};
@@ -2623,6 +2663,15 @@ bool WriteMetrics (bool bShutdown = false)
     WriteStatsEntryToFile (fp, g_Metric_PushRetryErrors.load (std::memory_order_relaxed),  "push_retry_total{result=\"error\"}");
 
     WriteStatsEntryToFileWithHelp (fp, g_Metric_PushRejected.load (std::memory_order_relaxed), "push_rejected_total", g_szPromTypeCounter, "Total number of push requests which are dropped for good, not kept in the WAL: the receiver refused them as bad data (HTTP 400), or they could not be converted to protobuf");
+
+    /* Only with a push target, which is where a WAL is used */
+    if (false == IsNullStr (g_szOtlpPushApiURL))
+    {
+        WriteStatsEntryToFileWithHelp (fp, static_cast<uint64_t> (g_Metric_WalRefused.load (std::memory_order_relaxed)), "wal_refused_total", g_szPromTypeCounter, "Total number of push requests which the WAL did not take (it was full, or a failure). They are lost");
+        WriteStatsEntryToFileWithHelp (fp, static_cast<uint64_t> (g_bWalOpened ? g_Wal.GetSize() : 0), "wal_bytes", g_szPromTypeGauge, "Size of the WAL: push requests which wait on disk for the receiver");
+    }
+
+    WriteStatsEntryToFileWithHelp (fp, static_cast<uint64_t> (g_Health.GetState()), "health", g_szPromTypeGauge, "Health for alerting: 0 is OK, 1 is a warning, 2 is an error");
 
     /* Only with protobuf. These are also counted in push_rejected_total */
     if (g_bPushProtobuf)
@@ -2691,6 +2740,7 @@ void *MetricsThread (void *arg)
         if (IdleDelay (10))
             break;
 
+        UpdateHealth();
         WriteMetrics();
     }
 

@@ -63,6 +63,7 @@
 #include <rapidjson/writer.h>
 
 #include "domfwd_durable.hpp"
+#include "../health.hpp"
 
 #include <stdarg.h>
 #include <time.h>
@@ -138,6 +139,10 @@ char  g_szSocketWal[512]                   = {0};
    or DOMFWD_Socket=tcp:127.0.0.1:4390. Events wait in a bounded queue in memory when the forwarder is connected and slow, and in a WAL
    on disk (DOMFWD_SocketWAL, Linux) when it is not reachable: see domfwd_durable.hpp. */
 DomfwdDurableSender g_SocketSender;
+uint64_t            g_SocketWalMaxBytes = 0;
+
+/* The health state for alerting (see ../health.hpp). Updated in the main loop, with the metrics */
+HealthMonitor       g_Health;
 
 #define DOMFWD_SOCKET_MAX_LINES      2000
 #define DOMFWD_SOCKET_MAX_BYTES      (4 * 1024 * 1024)
@@ -1368,6 +1373,7 @@ void LoadSocketConfig (void)
         WalMaxMB = DOMFWD_SOCKET_WAL_DEFAULT_MB;
 
     WalMaxBytes = (uint64_t) WalMaxMB * 1024 * 1024;
+    g_SocketWalMaxBytes = WalMaxBytes;
 
     if (g_SocketSender.Configure (g_szSocketTarget, SocketLog, DOMFWD_SOCKET_MAX_LINES, DOMFWD_SOCKET_MAX_BYTES, g_szSocketWal, WalMaxBytes, szError, sizeof (szError)))
     {
@@ -1449,6 +1455,40 @@ void LoadPromConfig (void)
         g_fPromEnabled = FALSE;
         AddInLogMessageText ("%s: Metrics file disabled (DOMFWD_PromFile=off)", 0, g_szTask);
     }
+}
+
+
+void HealthLog (const char *pszMessage)
+{
+    AddInLogMessageText ("%s: %s", 0, g_szTask, pszMessage);
+}
+
+
+/* Health for alerting: gives what is known now to the monitor, see ../health.hpp. Only the socket to the forwarder is watched:
+   the direct push has no counters. Called from the main loop, also when the metrics file is off */
+void UpdateHealth (void)
+{
+    HealthInput Input;
+
+    if (false == g_SocketSender.IsConfigured ())
+        return;
+
+    Input.bUnreachable = (false == g_SocketSender.IsConnected ());
+    Input.Dropped      = g_SocketSender.GetDropped ();
+    Input.Rejected     = g_SocketSender.GetRejected ();
+
+    /* A WAL was wanted: a path is set. It is not available on Windows, which is not an error there */
+#if !defined (_WIN32)
+    Input.bWalFailed  = ('\0' != g_szSocketWal[0]) && (false == g_SocketSender.HasWal ());
+#endif
+
+    if (g_SocketSender.HasWal ())
+    {
+        Input.WalBytes    = g_SocketSender.GetWalSize ();
+        Input.WalMaxBytes = g_SocketWalMaxBytes;
+    }
+
+    g_Health.Update (time (NULL), Input, HealthLog);
 }
 
 
@@ -1538,6 +1578,10 @@ void WritePromFile (void)
         fprintf (pFile, "# HELP domfwd_socket_connected 1 if connected to the forwarder\n");
         fprintf (pFile, "# TYPE domfwd_socket_connected gauge\n");
         fprintf (pFile, "domfwd_socket_connected %d\n", g_SocketSender.IsConnected () ? 1 : 0);
+
+        fprintf (pFile, "# HELP domfwd_health Health for alerting: 0 is OK, 1 is a warning, 2 is an error\n");
+        fprintf (pFile, "# TYPE domfwd_health gauge\n");
+        fprintf (pFile, "domfwd_health %d\n", g_Health.GetState ());
 
         /* Only with a WAL */
         if (g_SocketSender.HasWal ())
@@ -1863,6 +1907,7 @@ STATUS LNPUBLIC AddInMain (HMODULE hModule, int argc, char far *argv[])
         /* Metrics file every 30 seconds. Also right at the start, so the file shows up at once */
         if (time (NULL) >= tPromNext)
         {
+            UpdateHealth ();
             WritePromFile ();
             tPromNext = time (NULL) + DOMFWD_PROM_INTERVAL_SEC;
         }

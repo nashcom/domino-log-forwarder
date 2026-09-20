@@ -32,7 +32,7 @@ tsan:
 wal_sample:
 	$(MAKE) -C $(WAL_DIR) wal_sample
 
-otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(PUSH_HDR) $(LOG_HDR)
+otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(PUSH_HDR) $(LOG_HDR) health.hpp
 	$(CXX) $(CXXFLAGS) -I$(WAL_DIR) -o $@ otelfwd.cpp $(WAL_SRC) $(LDFLAGS)
 
 # Unit test of the failover (push_failover.hpp), of the converter (otlp_protobuf.hpp) and of the log lines (log_line.hpp). No network

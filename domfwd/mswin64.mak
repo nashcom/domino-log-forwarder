@@ -28,7 +28,7 @@ n$(PROGRAM).exe: $(PROGRAM).obj domfwd_ext.lib $(CURL_LIB)
 
 # Compile command
 
-$(PROGRAM).obj: $(PROGRAM).cpp domfwd_socket.hpp domfwd_durable.hpp
+$(PROGRAM).obj: $(PROGRAM).cpp domfwd_socket.hpp domfwd_durable.hpp ..\health.hpp
 	cl -nologo -c -D_MT -MT /Zi /Ot /O2 /Ob2 /Oy- -Gd /Gy /GF /Gs4096 /GS- /favor:INTEL64 /EHsc /Zc:wchar_t- /DWINVER=0x0602 -Zl -W1 -DNT -DW32 -DW -DW64 -DND64 -D_AMD64_ -DDTRACE -D_CRT_SECURE_NO_WARNINGS -DND64SERVER -DPRODUCTION_VERSION /DUSE_WIN32_IDN $(CURL_DEFINE) $(CURL_INC) $*.cpp
 
 # Import lib for undocumented event extraction exports, not present in notes.lib

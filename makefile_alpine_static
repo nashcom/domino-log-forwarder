@@ -11,7 +11,7 @@ all: $(TARGET)
 $(TARGET): $(OBJS)
 	$(CXX) $(LDFLAGS) -o $@ $(OBJS) $(LDLIBS)
 
-otelfwd.o: otelfwd.cpp wal/simple_wal.hpp push_status.hpp push_failover.hpp otlp_protobuf.hpp log_line.hpp
+otelfwd.o: otelfwd.cpp wal/simple_wal.hpp push_status.hpp push_failover.hpp otlp_protobuf.hpp log_line.hpp health.hpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 simple_wal.o: wal/simple_wal.cpp wal/simple_wal.hpp

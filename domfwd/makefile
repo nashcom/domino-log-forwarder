@@ -33,7 +33,7 @@ WALOBJECT = simple_wal.o
 $(TARGET): $(OBJECT) $(WALOBJECT)
 	$(CC) $(OBJECT) $(WALOBJECT) $(BOOTOBJS) -L$(NOTESDIR) -Wl,-rpath-link -no-pie $(NOTESDIR) $(LIBS) -o $(TARGET)
 
-$(OBJECT): $(SOURCE) domfwd_socket.hpp domfwd_durable.hpp $(WALDIR)/simple_wal.hpp
+$(OBJECT): $(SOURCE) domfwd_socket.hpp domfwd_durable.hpp ../health.hpp $(WALDIR)/simple_wal.hpp
 	$(CC) $(CCOPTS) $(DEFINES) -I$(INCDIR) -I$(WALDIR) $(SOURCE) -o $(OBJECT)
 
 $(WALOBJECT): $(WALDIR)/simple_wal.cpp $(WALDIR)/simple_wal.hpp

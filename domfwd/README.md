@@ -133,12 +133,24 @@ The add-in writes `<data>/domino/stats/domfwd.prom` every 30 seconds and at shut
 | `domfwd_socket_wal_written_total`               | counter | Records written to the WAL: `otelfwd` was not connected, or records waited            |
 | `domfwd_socket_wal_taken_total`                 | counter | Records taken out of the WAL and given to the sender                                  |
 | `domfwd_socket_wal_refused_total`               | counter | Records which the WAL did not take (it was full, or a failure). They are dropped      |
+| `domfwd_health`                                 | gauge   | Health for alerting: 0 is OK, 1 is a warning, 2 is an error, see [Health](#health)    |
 
-The `domfwd_socket_*` metrics are only written if a socket is configured, and the `domfwd_socket_wal_*` metrics only with a WAL. A WAL which grows (`domfwd_socket_wal_bytes`) while `domfwd_socket_connected` is 1 means that `otelfwd` takes the events more slowly than they come.
+The `domfwd_socket_*` metrics and `domfwd_health` are only written if a socket is configured, and the `domfwd_socket_wal_*` metrics only with a WAL. A WAL which grows (`domfwd_socket_wal_bytes`) while `domfwd_socket_connected` is 1 means that `otelfwd` takes the events more slowly than they come.
 
 The counters show where records get lost. If `domfwd_events_received_total` grows but `domfwd_socket_sent_total` does not, the problem is inside the add-in or at the socket. If `domfwd_socket_sent_total` matches the lines `otelfwd` accepted on its socket (`otelfwd_socket_lines_total{result="accepted"}`) but fewer are pushed, look at `otelfwd` and the receiver.
 
 A quiet server can legitimately have no events for a long time, so `domfwd_last_event_timestamp_seconds` alone is not a good alert. Use it together with the counters and `domfwd_socket_connected`.
+
+## Health
+
+`domfwd_health` is one number for alerting: **0** is OK (green), **1** is a warning (yellow), **2** is an error (red). It is updated every 30 seconds, and a change of the state is logged once with the reason, for example `domfwd: Health: WARNING (the receiver is not reachable for more than 15 minutes)`. The rules are the same as in `otelfwd`, see [Health](../README.md#health) in the main README: the WAL fill (25% warning, 50% error), a connection which is down for more than 15 minutes (warning) or 30 minutes (error), and data which was dropped or rejected in the last 10 minutes.
+
+What `domfwd` watches:
+
+* **Not reachable** means that the socket to `otelfwd` is not connected.
+* **Dropped** is `domfwd_socket_dropped_total`, **rejected** is `domfwd_socket_rejected_total`.
+* **The WAL** is `domfwd_socket_wal_bytes` against `DOMFWD_SocketWALMaxMB`. A WAL which is configured and cannot be opened is an error (not on Windows, where there is no WAL).
+* Only the socket is watched. The direct push (`DOMFWD_OtelPushURL`) has no counters, so there is no health for it, and the metric is not written without a socket.
 
 ## Build
 

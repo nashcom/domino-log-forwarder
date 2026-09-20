@@ -586,6 +586,9 @@ Metrics are written to the Prometheus file (`OTELFWD_PROM_FILE`) every 10 second
 | `otelfwd_push_total{result="success\|error"}`           | Log lines pushed, by result                                                                                                                               |
 | `otelfwd_push_retry_total{result="success\|error"}`     | WAL records (one push request each) replayed, by result                                                                                                   |
 | `otelfwd_push_rejected_total`                           | Push requests which the receiver refused as bad data (HTTP 400) and which were dropped                                                                    |
+| `otelfwd_wal_bytes`                                     | Gauge. Size of the WAL: push requests which wait on disk for the receiver. Only with a push target                                                        |
+| `otelfwd_wal_refused_total`                             | Push requests which the WAL did not take (it was full, or a failure). They are lost. Only with a push target                                              |
+| `otelfwd_health`                                        | Gauge. Health for alerting: 0 is OK, 1 is a warning, 2 is an error, see [Health](#health)                                                                 |
 | `otelfwd_push_endpoint_active`                          | Gauge. The endpoint in use: 0 is the primary, 1 is the backup                                                                                             |
 | `otelfwd_push_endpoint_requests_total{endpoint,result}` | Push requests to an endpoint (`primary`, `backup`). `result`: `accepted`, `retry`, `rejected`. A try of the primary while the backup is in use counts too |
 | `otelfwd_push_failovers_total`                          | Times the backup was taken into use because the primary failed                                                                                            |
@@ -594,6 +597,31 @@ Metrics are written to the Prometheus file (`OTELFWD_PROM_FILE`) every 10 second
 | `otelfwd_socket_connections_total{source,result}`       | Connections on a socket input. `result`: `accepted`, `rejected`                                                                                           |
 
 The `otelfwd_push_endpoint_*`, `failovers` and `failbacks` metrics are only written if a backup endpoint is configured. `source` is `unix`, `tcp` or `syslog`. The socket metrics are only written for enabled inputs. The syslog input is a datagram socket and has no connection metrics.
+
+## Health
+
+`otelfwd_health` is one number for alerting: **0** is OK (green), **1** is a warning (yellow), **2** is an error (red). `domfwd` has the same metric (`domfwd_health`) with the same rules. It is calculated in the program, and updated when the metrics are written. A change of the state is logged once with the reason, for example `Health: WARNING (the WAL is more than a quarter full)`.
+
+The worst of these rules wins. Otherwise the state is OK, also in the first minutes of an outage: a restart of the receiver does not raise an alert.
+
+| Rule                                                                             | Warning (1) | Error (2)  |
+| :------------------------------------------------------------------------------- | :---------- | :--------- |
+| The WAL is full to a share of its size limit                                     | 25%         | 50%        |
+| The receiver is not reachable for longer than                                    | 15 minutes  | 30 minutes |
+| Data was dropped in the last 10 minutes (the WAL was full or refused it)         |             | yes        |
+| Data was rejected for good in the last 10 minutes (HTTP 400, or an invalid line) | yes         |            |
+| A WAL is needed and could not be opened                                          |             | yes        |
+
+For `otelfwd` "not reachable" means that no push was accepted since the last failed one: the counter of failed pushes grew, and none succeeded. Nothing to push means no change. Without a size limit (`OTLP_PUSH_WAL_MAX_MB=0`) there is no fill to measure, and only the other rules apply. The limits are in `health.hpp`.
+
+Alert rules, for example:
+
+```
+otelfwd_health > 0        # warning
+otelfwd_health == 2       # page
+```
+
+A program which has stopped writes no metrics at all, so also alert on a missing metric or on a metrics file which is not updated (`otelfwd_lastupdate_timestamp_seconds`).
 
 ## Migration from version 1.x
 
