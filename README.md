@@ -474,7 +474,6 @@ Example: a Domino event.
     "domino.event.type": "Resource",
     "domino.event.time": "2026-08-03T12:35:54.89Z",
     "domino.error.code": 259,
-    "domino.error.text": "Database compactor error: File does not exist",
     "domino.error.additional_code": 259,
     "domino.addin.name": "Database Compactor",
     "domino.target.server": "CN=makemake/O=NotesLab",

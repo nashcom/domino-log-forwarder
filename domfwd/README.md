@@ -54,7 +54,6 @@ One event, as sent to `otelfwd`:
     "domino.event.type": "Resource",
     "domino.event.time": "2026-08-03T12:35:54.89Z",
     "domino.error.code": 259,
-    "domino.error.text": "Database compactor error: File does not exist",
     "domino.error.additional_code": 259,
     "domino.addin.name": "Database Compactor",
     "domino.target.server": "CN=makemake/O=NotesLab",
@@ -65,6 +64,8 @@ One event, as sent to `otelfwd`:
 ```
 
 The record is sent as one line. `otelfwd` passes all of it on unchanged.
+
+The error text of the event is the `body`. It is not repeated as an attribute.
 
 ## Configuration (notes.ini)
 

@@ -1129,7 +1129,6 @@ void BuildOtelFields (const DOMFWD_EVENT_INFO *pInfo, DOMFWD_OTEL_FIELDS *retpFi
     AddKV    (retpFields->AttributeKV, &retpFields->wAttributeKVCount, DOMFWD_MAX_ATTRIBUTE_KV, "domino.event.type",            GetEventTypeName (pInfo->wType));
     AddKV    (retpFields->AttributeKV, &retpFields->wAttributeKVCount, DOMFWD_MAX_ATTRIBUTE_KV, "domino.event.time",            pInfo->szEventTime);
     AddKVInt (retpFields->AttributeKV, &retpFields->wAttributeKVCount, DOMFWD_MAX_ATTRIBUTE_KV, "domino.error.code",            (LONG) pInfo->wErrorCode);
-    AddKV    (retpFields->AttributeKV, &retpFields->wAttributeKVCount, DOMFWD_MAX_ATTRIBUTE_KV, "domino.error.text",            retpFields->szErrorTextUtf8);
     AddKVInt (retpFields->AttributeKV, &retpFields->wAttributeKVCount, DOMFWD_MAX_ATTRIBUTE_KV, "domino.error.additional_code", (LONG) pInfo->wAdditionalErrorCode);
 
     if (pInfo->fExtValid)
