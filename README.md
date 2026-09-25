@@ -188,8 +188,9 @@ Plan the instances first, one row each. Everything in a column must differ betwe
 | File input              | `OTELFWD_FILE_INPUT`                                                                                     | A file is followed by one instance. Its state file is next to it by default, or in `OTELFWD_FILE_STATE_DIR`                                                                                                                                                                                                                                                                                                                                                       |
 | STDIN                   | `otelfwd` without `-nostdin`                                                                             | There is one STDIN: the pipe of the Domino console log. Only one instance reads it, all the others run with `-nostdin`                                                                                                                                                                                                                                                                                                                                            |
 | Target and its format   | `OTLP_PUSH_API_URL`, `OTLP_PUSH_API_URL_BACKUP`, `OTLP_PUSH_ENCODING`, `OTLP_PUSH_TOKEN`, `OTLP_CA_FILE` | This is what the instances are for: each has its own. Each backend documents the URL path and the encoding it expects                                                                                                                                                                                                                                                                                                                                             |
-| Identity of the records | `OTLP_SERVICE_NAME`, `OTLP_SERVICE_NAMESPACE`, `OTLP_SERVICE_INSTANCE_ID`, `OTELFWD_HOSTNAME`            | The default resource of the records which carry none. Set them if the records of the instances should be told apart by it                                                                                                                                                                                                                                                                                                                                         |
-| Metrics file            | `OTELFWD_PROM_FILE`                                                                                      | The default is below the data directory, so it differs already. The metrics of all instances have the same names and no label which says which instance they come from: keep the files apart when you collect them                                                                                                                                                                                                                                                |
+| Instance name           | `OTELFWD_INSTANCE`                                                                                       | The name of the instance, for example `mail` or `domino`: the label `otelfwd_instance` of every metric. Set it on every instance if the metrics files of several instances are collected together, otherwise their lines cannot be told apart. Not set: no label, and the metrics are as they always were                                                                                                                                                         |
+| Identity of the records | `OTLP_SERVICE_NAME`, `OTLP_SERVICE_NAMESPACE`, `OTLP_SERVICE_INSTANCE_ID`, `OTELFWD_HOSTNAME`            | The default resource of the records which carry none. Set them if the records of the instances should be told apart by it. The label of the metrics is not one of them: it is `OTELFWD_INSTANCE`, see the row above                                                                                                                                                                                                                                               |
+| Metrics file            | `OTELFWD_PROM_FILE`                                                                                      | The default is below the data directory, so it differs already. The metrics of all instances have the same names, and the label `otelfwd_instance` (the value of `OTELFWD_INSTANCE`) tells the instances apart when it is set, see [Metrics](#metrics)                                                                                                                                                                                                            |
 
 The default UNIX socket (`<data>/domino/otelfwd.sock`) is only opened when `OTLP_PUSH_API_URL` is set and none of the three socket
 settings is configured. An instance with an explicit socket, port or syslog socket does not open it. A socket is created with the
@@ -201,6 +202,7 @@ producers which write to them.
 The instances of the plan above. The URLs and the encodings are examples: see the documentation of each backend.
 
 ```bash
+OTELFWD_INSTANCE=mail \
 OTELFWD_DATA_DIR=/var/lib/otelfwd-mail \
 OTELFWD_UNIX_SOCKET=/run/otelfwd-mail/otelfwd.sock \
 OTELFWD_TCP_LISTEN=127.0.0.1:4391 \
@@ -210,6 +212,7 @@ otelfwd -nostdin
 ```
 
 ```bash
+OTELFWD_INSTANCE=domino \
 OTELFWD_DATA_DIR=/var/lib/otelfwd-domino \
 OTELFWD_UNIX_SOCKET=/run/otelfwd-domino/otelfwd.sock \
 OTELFWD_TCP_LISTEN=127.0.0.1:4392 \
@@ -371,13 +374,14 @@ If no output log file is specified, no output log is written.
 
 Most of the following parameters are optional.
 
-| Variable Name              | Description                                                                       | Example / Comments                               |
-| :------------------------- | :-------------------------------------------------------------------------------- | :----------------------------------------------- |
-| `OTELFWD_DATA_DIR`         | Data directory. Has to be writable. Used for the WAL and the default metrics file | default: `/local/notesdata`                      |
-| `OTELFWD_LOGLEVEL`         | Log level for stdout logging                                                      | `1`                                              |
-| `OTELFWD_HOSTNAME`         | Hostname to use                                                                   | default: hostname read from OS                   |
-| `OTELFWD_PROM_FILE`        | Prom File for Metrics output                                                      | default: `<notesdata>/domino/stats/otelfwd.prom` |
-| `OTELFWD_SHUTDOWN_MAX_SEC` | Shutdown max wait seconds                                                         | default: `30`                                    |
+| Variable Name              | Description                                                                                                                                          | Example / Comments                               |
+| :------------------------- | :--------------------------------------------------------------------------------------------------------------------------------------------------- | :----------------------------------------------- |
+| `OTELFWD_DATA_DIR`         | Data directory. Has to be writable. Used for the WAL and the default metrics file                                                                    | default: `/local/notesdata`                      |
+| `OTELFWD_LOGLEVEL`         | Log level for stdout logging                                                                                                                         | `1`                                              |
+| `OTELFWD_HOSTNAME`         | Hostname to use                                                                                                                                      | default: hostname read from OS                   |
+| `OTELFWD_INSTANCE`         | Name of this instance, for example `mail`. Only needed when more than one instance runs: it is added to every metric as the label `otelfwd_instance` | default: not set, no label                       |
+| `OTELFWD_PROM_FILE`        | Prom File for Metrics output                                                                                                                         | default: `<notesdata>/domino/stats/otelfwd.prom` |
+| `OTELFWD_SHUTDOWN_MAX_SEC` | Shutdown max wait seconds                                                                                                                            | default: `30`                                    |
 
 ### OTLP push configuration
 
@@ -692,7 +696,7 @@ Both scripts print how many lines were pushed and return an error if the push fa
 
 ### Unit test of otelfwd
 
-`otelfwd_unit_test.cpp` tests the pieces of `otelfwd` which need no network and no other program: the failover between two endpoints, the converter from JSON to protobuf, and the format of the log lines. `make test` builds and runs it, or directly:
+`otelfwd_unit_test.cpp` tests the pieces of `otelfwd` which need no network and no other program: the failover between two endpoints, the converter from JSON to protobuf, the format of the log lines, and the label of the metrics. `make test` builds and runs it, or directly:
 
 ```bash
 ./otelfwd_unit_test
@@ -710,6 +714,8 @@ It checks: no backup, a working primary, the failover and that the backup stays 
 * What must be refused: broken JSON, more than one JSON value, a member or a type of value which the converter does not know, a value with two types, wrong types, and numbers which are out of range. An error returns no bytes, and the error text names the member.
 
 **The log lines** (`log_line.hpp`): the console output of `otelfwd`. The time is UTC in ISO 8601, then two blanks, the process name (in pipe mode), the level, the message and a text. The expected times are what the `date` command says for the same number of seconds, also when the host time zone is 12 hours ahead. The lines are written to stderr in one piece, and without a process name with `-nostdin`.
+
+**The metrics label** (`prom_label.hpp`): the label `otelfwd_instance` which is added to the name of every metric when `OTELFWD_INSTANCE` is set, in front of the labels it has (`otelfwd_push_total{result="success"}` becomes `otelfwd_push_total{otelfwd_instance="mail",result="success"}`), and the removal of it, which the load test uses to find a metric by its name with or without the label. It checks a metric without labels, with one and with more, an empty value, the escaping of a quote, a backslash and a new line, and that adding and removing it again gives the name back.
 
 ### Unit test of the durable sender of domfwd
 
@@ -763,6 +769,15 @@ Two options of the load test check the two endpoints of `otelfwd` with the same 
 ## Metrics
 
 Metrics are written to the Prometheus file (`OTELFWD_PROM_FILE`) every 10 seconds and at shutdown.
+
+With more than one instance, `OTELFWD_INSTANCE` names each instance, for example `mail` or `domino`, and every metric line then
+has the label `otelfwd_instance` with that name, in front of the labels a metric has: `otelfwd_push_total{result="success"}` is
+written as `otelfwd_push_total{otelfwd_instance="mail",result="success"}`. Two instances write the same metric names, and with
+the label a collector which reads the files of both can tell them apart, and a query can select one instance or add them up. The
+names in the table are without it. **Without `OTELFWD_INSTANCE` there is no label at all** and the file is exactly what it was
+before: one instance does not need it. The label is not called `instance`, because Prometheus adds its own `instance` label to
+every target it scrapes and renames a clashing one to `exported_instance`. See
+[Running more than one instance](#running-more-than-one-instance).
 
 | Metric                                                  | Description                                                                                                                                               |
 | :------------------------------------------------------ | :-------------------------------------------------------------------------------------------------------------------------------------------------------- |

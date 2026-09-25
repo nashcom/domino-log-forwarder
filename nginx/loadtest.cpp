@@ -35,6 +35,8 @@
 #include <thread>
 #include <vector>
 
+#include "../prom_label.hpp"
+
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -476,7 +478,8 @@ static bool ReadProm (const std::string& File, PromValues& retProm)
         if ( Line.empty() || ('#' == Line[0]) || (std::string::npos == Space) )
             continue;
 
-        retProm.Values[Line.substr (0, Space)] = atof (Line.c_str() + Space + 1);
+        /* Since otelfwd labels every metric with the instance, the name is looked up without that label: the same names as before */
+        retProm.Values[PromRemoveLabel (Line.substr (0, Space), "otelfwd_instance")] = atof (Line.c_str() + Space + 1);
     }
 
     retProm.LastUpdate = retProm.Values.count ("otelfwd_lastupdate_timestamp_seconds") ? retProm.Values["otelfwd_lastupdate_timestamp_seconds"] : 0;

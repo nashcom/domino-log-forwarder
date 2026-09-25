@@ -45,12 +45,12 @@ wal_sample:
 mail_log_sample:
 	$(MAKE) -C $(MAILLOG_DIR) mail_log_sample
 
-otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(FILEREADER_SRC) $(FILEREADER_HDR) $(PUSH_HDR) $(LOG_HDR) health.hpp file_input.hpp
+otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(FILEREADER_SRC) $(FILEREADER_HDR) $(PUSH_HDR) $(LOG_HDR) health.hpp file_input.hpp prom_label.hpp
 	$(CXX) $(CXXFLAGS) -I$(WAL_DIR) -I$(FILEREADER_DIR) -o $@ otelfwd.cpp $(WAL_SRC) $(FILEREADER_SRC) $(LDFLAGS)
 
 # Unit test of the failover (push_failover.hpp), of the converter (otlp_protobuf.hpp) and of the log lines (log_line.hpp). No network
 # Needs the rapidjson headers
-otelfwd_unit_test: otelfwd_unit_test.cpp $(PUSH_HDR) $(LOG_HDR) file_input.hpp
+otelfwd_unit_test: otelfwd_unit_test.cpp $(PUSH_HDR) $(LOG_HDR) file_input.hpp prom_label.hpp
 	$(CXX) $(CXXFLAGS) -pthread -o $@ otelfwd_unit_test.cpp
 
 # Unit test of the durable line sender of domfwd: the socket sender and the WAL together. It starts a small server of its own on
@@ -65,7 +65,7 @@ otel-sink: tools/otel-sink/otel-sink.cpp tools/otel-sink/test_ledger.hpp
 
 # Test tool: load test of NGINX -> otelfwd -> otel-sink, see nginx/. Not part of "all".
 #   make loadtest                 needs the rapidjson headers
-loadtest: nginx/loadtest.cpp
+loadtest: nginx/loadtest.cpp prom_label.hpp
 	$(CXX) $(CXXFLAGS) -pthread -o $@ nginx/loadtest.cpp
 
 clean:

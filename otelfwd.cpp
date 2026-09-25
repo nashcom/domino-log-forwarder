@@ -113,6 +113,7 @@
 #include "log_line.hpp"
 #include "health.hpp"
 #include "file_input.hpp"
+#include "prom_label.hpp"
 #include "file_reader.hpp"
 
 /* pid.nbf map definition */
@@ -330,6 +331,7 @@ char g_szEnvOtlpCaFile[]             = "OTLP_CA_FILE";
 char g_szEnvOtlpServiceName[]        = "OTLP_SERVICE_NAME";
 char g_szEnvOtlpServiceNamespace[]   = "OTLP_SERVICE_NAMESPACE";
 char g_szEnvOtlpServiceInstanceId[]  = "OTLP_SERVICE_INSTANCE_ID";
+char g_szEnvInstance[]               = "OTELFWD_INSTANCE";
 
 
 /* Globals */
@@ -365,6 +367,7 @@ char g_szDataDir[1024]      = "/local/notesdata";
 char g_szOtlpServiceName[1024]   = "domino";
 char g_szServiceNamespace[1024]  = "domino";
 char g_szServiceInstanceId[1024] = "";
+char g_szInstance[256]           = "";      /* OTELFWD_INSTANCE: the name of this instance, only set if more than one runs. Empty: no label on the metrics */
 
 /* Static string definitions */
 char g_szVersion[40]           = {0};
@@ -376,6 +379,7 @@ char  g_szPromTypeGauge[]      = "gauge";
 char  g_szPromTypeCounter[]    = "counter";
 char  g_szPromTypeUntyped[]    = "untyped";
 char  g_szPromPrefix[]         = "otelfwd";
+char  g_szPromInstanceLabel[]  = "otelfwd_instance";      /* the label which tells two instances apart, its value is g_szInstance. Only there if that is set */
 char  g_szEmpty[]              = "";
 char  g_szProcessEmpty[]       = "unknown";
 
@@ -2755,6 +2759,15 @@ bool WriteHelpAndType (FILE *fp, const char *pszStatName, const char *pszType, c
 }
 
 
+/* The name of a metric as it is written: the prefix, the name (which can have labels of its own), and, if OTELFWD_INSTANCE is set, the
+   label which tells this instance from another one. Two instances write the same names, and a collector which reads both files needs
+   the label to tell the lines apart. Without the setting the name is exactly what it was before the label existed */
+static std::string PromMetricName (const char *pszStatName)
+{
+    return PromAddLabel (std::string (g_szPromPrefix) + "_" + pszStatName, g_szPromInstanceLabel, g_szInstance);
+}
+
+
 bool WriteStatsEntryToFile (FILE *fp, uint64_t ValueNum, const char *pszStatName)
 {
     if (NULL == fp)
@@ -2763,7 +2776,7 @@ bool WriteStatsEntryToFile (FILE *fp, uint64_t ValueNum, const char *pszStatName
     if (NULL == pszStatName)
         return false;
 
-    fprintf (fp, "%s_%s %zu\n", g_szPromPrefix, pszStatName, ValueNum);
+    fprintf (fp, "%s %zu\n", PromMetricName (pszStatName).c_str(), static_cast<size_t> (ValueNum));
 
     return true;
 }
@@ -2777,7 +2790,7 @@ bool WriteStatsEntryToFileWithHelp (FILE *fp, uint64_t ValueNum, const char *psz
         return false;
 
     WriteHelpAndType (fp, pszStatName, pszType, pszDescription);
-    fprintf (fp, "%s_%s %zu\n", g_szPromPrefix, pszStatName, ValueNum);
+    fprintf (fp, "%s %zu\n", PromMetricName (pszStatName).c_str(), static_cast<size_t> (ValueNum));
 
     return true;
 }
@@ -3121,6 +3134,9 @@ void LogStartupSummary (bool bWalOpened)
     LogSetting ("OTLP Service Namespace", g_szServiceNamespace);
     LogSetting ("OTLP Service Instance",  g_szServiceInstanceId);
 
+    if (*g_szInstance)
+        LogSetting ("Instance",           std::string (g_szInstance) + " (the label " + g_szPromInstanceLabel + " of every metric)");
+
     /* The inputs which listen: what is configured, or the default socket. They need a push target: without one they are reported and
        disabled later */
     if (false == IsNullStr (g_szUnixSocketPath))
@@ -3410,6 +3426,7 @@ void PrintHelp ()
     LogHelpEnv (g_szEnvOtlpServiceName,       "OTLP service.name (default: domino)");
     LogHelpEnv (g_szEnvOtlpServiceNamespace,  "OTLP service.namespace (default: domino)");
     LogHelpEnv (g_szEnvOtlpServiceInstanceId, "OTLP service.instance.id (default: hostname)");
+    LogHelpEnv (g_szEnvInstance,              "Name of this instance, for example mail. Only needed when more than one instance runs: it is added to every metric as the label otelfwd_instance (default: no label)");
 
     g_List.AddText ("");
 
@@ -3520,6 +3537,7 @@ void DumpConfig (bool bShowEnvVars = false)
     LogCfgText (bShowEnvVars, "OTLP Service Name",       g_szOtlpServiceName,  g_szEnvOtlpServiceName);
     LogCfgText (bShowEnvVars, "OTLP Service Namespace",  g_szServiceNamespace, g_szEnvOtlpServiceNamespace);
     LogCfgText (bShowEnvVars, "OTLP Service Instance",   g_szServiceInstanceId, g_szEnvOtlpServiceInstanceId);
+    LogCfgText (bShowEnvVars, "Instance",                g_szInstance,         g_szEnvInstance);
     LogCfgText (bShowEnvVars, "WAL File",                g_szWalFile);
 
     g_List.AddText ("");
@@ -3722,6 +3740,11 @@ int main (int argc, char *argv[])
         snprintf (g_szServiceInstanceId, sizeof (g_szServiceInstanceId), "%s", p);
     else
         snprintf (g_szServiceInstanceId, sizeof (g_szServiceInstanceId), "%s", g_szHostname);
+
+    /* The name of this instance. Not set: one instance, and the metrics have no label for it */
+    p = getenv (g_szEnvInstance);
+    if (p && *p)
+        snprintf (g_szInstance, sizeof (g_szInstance), "%s", p);
 
     p = getenv (g_szEnvUnixSocket);
     if (p)

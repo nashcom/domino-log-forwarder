@@ -26,6 +26,9 @@
       position up to which lines were delivered to the file thread. The names of two paths are written down in the test: a name which changes between versions
       loses the position of every file. The file itself is read by the FileReader, which has a test of its own (filereader/).
 
+   5. The label of the metrics (prom_label.hpp): the instance label which is added to every metric name, and its removal. The load test
+      uses the removal to find a metric by its name with or without the label.
+
    Build and run:  make otelfwd_unit_test && ./otelfwd_unit_test        (or: make test)
 
    Every check prints [PASS] or [FAIL]. The end of the output has a section "Failed checks" (only if there are any) and a
@@ -46,6 +49,7 @@
 #include "otlp_protobuf.hpp"
 #include "log_line.hpp"
 #include "file_input.hpp"
+#include "prom_label.hpp"
 
 
 static int g_Total  = 0;
@@ -1026,6 +1030,79 @@ static void TestFileCommitSlot ()
 }
 
 
+/* The label which tells two instances apart: added to the name of every metric, in front of the labels which are there.
+   The Prometheus text format: the value is in double quotes, and a backslash, a double quote and a new line are escaped */
+static void TestPromLabel ()
+{
+    Check ("otelfwd_health{otelfwd_instance=\"mail\"}" == PromAddLabel ("otelfwd_health", "otelfwd_instance", "mail"),
+           "prom label: a metric without labels gets the label in braces");
+
+    Check ("otelfwd_push_total{otelfwd_instance=\"mail\",result=\"success\"}" == PromAddLabel ("otelfwd_push_total{result=\"success\"}", "otelfwd_instance", "mail"),
+           "prom label: a metric with a label gets the new one in front of it, separated by a comma");
+
+    Check ("otelfwd_x{otelfwd_instance=\"mail\",a=\"1\",b=\"2\"}" == PromAddLabel ("otelfwd_x{a=\"1\",b=\"2\"}", "otelfwd_instance", "mail"),
+           "prom label: more than one label which is there is kept, in the same order");
+
+    Check ("otelfwd_x{otelfwd_instance=\"mail\"}" == PromAddLabel ("otelfwd_x{}", "otelfwd_instance", "mail"),
+           "prom label: empty braces are filled, not doubled");
+
+    Check ("otelfwd_x{otelfwd_instance=\"mail\"}" == PromAddLabel ("otelfwd_x{", "otelfwd_instance", "mail"),
+           "prom label: a name with an open brace and nothing else is closed");
+
+    Check ("otelfwd_health" == PromAddLabel ("otelfwd_health", "otelfwd_instance", ""),
+           "prom label: without a value the name is not changed");
+
+    Check ("otelfwd_health" == PromAddLabel ("otelfwd_health", "", "mail"),
+           "prom label: without a label name the name is not changed");
+
+    Check ("otelfwd_health{otelfwd_instance=\"CN=earth/O=NotesLab\"}" == PromAddLabel ("otelfwd_health", "otelfwd_instance", "CN=earth/O=NotesLab"),
+           "prom label: the distinguished name of a Domino server is a value like any other, = and / are not escaped");
+
+    Check ("a\\\"b\\\\c\\nd" == PromEscapeLabelValue ("a\"b\\c\nd"),
+           "prom label: a double quote, a backslash and a new line in a value are escaped");
+
+    Check ("otelfwd_health{otelfwd_instance=\"a\\\"b\"}" == PromAddLabel ("otelfwd_health", "otelfwd_instance", "a\"b"),
+           "prom label: the value in the name is escaped, so a quote in it does not end the value");
+
+    /* Removing it again, for a reader which finds a metric by its name and its labels: the load test */
+    Check ("otelfwd_health" == PromRemoveLabel ("otelfwd_health{otelfwd_instance=\"mail\"}", "otelfwd_instance"),
+           "prom label removed: the only label goes, and the braces with it");
+
+    Check ("otelfwd_push_total{result=\"success\"}" == PromRemoveLabel ("otelfwd_push_total{otelfwd_instance=\"mail\",result=\"success\"}", "otelfwd_instance"),
+           "prom label removed: the label in front of another one goes with its comma");
+
+    Check ("otelfwd_x{a=\"1\",b=\"2\"}" == PromRemoveLabel ("otelfwd_x{a=\"1\",otelfwd_instance=\"mail\",b=\"2\"}", "otelfwd_instance"),
+           "prom label removed: a label in the middle goes with one comma");
+
+    Check ("otelfwd_x{a=\"1\"}" == PromRemoveLabel ("otelfwd_x{a=\"1\",otelfwd_instance=\"mail\"}", "otelfwd_instance"),
+           "prom label removed: the last label goes with the comma before it");
+
+    Check ("otelfwd_health" == PromRemoveLabel ("otelfwd_health", "otelfwd_instance"),
+           "prom label removed: a name without labels is not changed");
+
+    Check ("otelfwd_x{result=\"a\"}" == PromRemoveLabel ("otelfwd_x{result=\"a\"}", "otelfwd_instance"),
+           "prom label removed: a name without this label is not changed");
+
+    Check ("otelfwd_x{my_otelfwd_instance=\"a\"}" == PromRemoveLabel ("otelfwd_x{my_otelfwd_instance=\"a\"}", "otelfwd_instance"),
+           "prom label removed: the end of the name of another label is not the label");
+
+    Check ("otelfwd_health" == PromRemoveLabel ("otelfwd_health{otelfwd_instance=\"a\\\"b,c\"}", "otelfwd_instance"),
+           "prom label removed: a value with an escaped quote and a comma in it is removed as a whole");
+
+    /* Adding it and removing it again gives the name back. Empty braces are the one exception: the braces are gone with the label */
+    struct RoundTrip { const char *pszName; const char *pszBack; };
+
+    const RoundTrip Names[] = { { "otelfwd_health", "otelfwd_health" },
+                                { "otelfwd_push_total{result=\"success\"}", "otelfwd_push_total{result=\"success\"}" },
+                                { "otelfwd_x{a=\"1\",b=\"2\"}", "otelfwd_x{a=\"1\",b=\"2\"}" },
+                                { "otelfwd_x{}", "otelfwd_x" } };
+
+    for (const RoundTrip& Case : Names)
+        Check (std::string (Case.pszBack) == PromRemoveLabel (PromAddLabel (Case.pszName, "otelfwd_instance", "CN=earth/O=NotesLab"), "otelfwd_instance"),
+               (std::string ("prom label: adding it and removing it again gives the name back: ") + Case.pszName).c_str());
+}
+
+
 int main ()
 {
     setvbuf (stdout, NULL, _IOLBF, 0);
@@ -1074,6 +1151,9 @@ int main ()
     TestLogTime();
     TestLogLine();
     TestLogOutput();
+
+    Group ("Metrics: the label which tells two instances apart");
+    TestPromLabel();
 
     Group ("File input: the severity, the names of the state files, and the hand over of the position");
     TestFileSeverity();
