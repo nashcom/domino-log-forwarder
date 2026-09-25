@@ -12,6 +12,11 @@
 
 # The file reader module: unit test
 /filereader/file_reader_unit_test
+
+# The MailLog module: unit test and sample
+/mail-log/mail_log_unit_test
+/mail-log/mail_log_sample
+
 otel-received/
 otel-data/
 

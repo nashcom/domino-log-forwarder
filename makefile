@@ -16,18 +16,22 @@ FILEREADER_DIR = filereader
 FILEREADER_SRC = $(FILEREADER_DIR)/file_reader.cpp
 FILEREADER_HDR = $(FILEREADER_DIR)/file_reader.hpp
 
+# MailLog is a module of its own too, with its test and its README: see mail-log/README.md. Not used by otelfwd or domfwd yet
+MAILLOG_DIR = mail-log
+
 PUSH_HDR = push_status.hpp push_failover.hpp otlp_protobuf.hpp
 LOG_HDR  = log_line.hpp
 
 # Targets which are not files. Without this a file named "test" would make "make test" do nothing
-.PHONY: all test tsan wal_sample clean
+.PHONY: all test tsan wal_sample mail_log_sample clean
 
 all: $(TARGET)
 
-# Builds and runs the unit tests: the WAL (in wal/, with its sample program), and the pieces of otelfwd (failover between two OTLP
-# endpoints, JSON to protobuf converter, log lines). Both run, even if one fails
+# Builds and runs the unit tests: the WAL (in wal/, with its sample program), the file reader (filereader/), MailLog (mail-log/, with its
+# sample program), and the pieces of otelfwd (failover between two OTLP
+# endpoints, JSON to protobuf converter, log lines). All of them run, even if one fails
 test: $(TARGET_TEST)
-	@fail=0; $(MAKE) -C $(WAL_DIR) test || fail=1; $(MAKE) -C $(FILEREADER_DIR) test || fail=1; for t in $(TARGET_TEST); do ./$$t || fail=1; done; exit $$fail
+	@fail=0; $(MAKE) -C $(WAL_DIR) test || fail=1; $(MAKE) -C $(FILEREADER_DIR) test || fail=1; $(MAKE) -C $(MAILLOG_DIR) test || fail=1; for t in $(TARGET_TEST); do ./$$t || fail=1; done; exit $$fail
 
 # The WAL test with ThreadSanitizer, see wal/makefile. Not part of "make test": it needs g++ with the sanitizer library (libtsan)
 tsan:
@@ -36,6 +40,10 @@ tsan:
 # The sample program of the WAL, see wal/wal_sample.cpp:  make wal_sample && ./wal/wal_sample
 wal_sample:
 	$(MAKE) -C $(WAL_DIR) wal_sample
+
+# The sample program of MailLog, see mail-log/mail_log_sample.cpp:  make mail_log_sample && ./mail-log/mail_log_sample
+mail_log_sample:
+	$(MAKE) -C $(MAILLOG_DIR) mail_log_sample
 
 otelfwd: otelfwd.cpp $(WAL_SRC) $(WAL_HDR) $(FILEREADER_SRC) $(FILEREADER_HDR) $(PUSH_HDR) $(LOG_HDR) health.hpp file_input.hpp
 	$(CXX) $(CXXFLAGS) -I$(WAL_DIR) -I$(FILEREADER_DIR) -o $@ otelfwd.cpp $(WAL_SRC) $(FILEREADER_SRC) $(LDFLAGS)
@@ -68,4 +76,5 @@ clean:
 	rm -f *.o
 	$(MAKE) -C $(WAL_DIR) clean
 	$(MAKE) -C $(FILEREADER_DIR) clean
+	$(MAKE) -C $(MAILLOG_DIR) clean
 
