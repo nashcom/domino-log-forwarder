@@ -23,7 +23,7 @@ PUSH_HDR = push_status.hpp push_failover.hpp otlp_protobuf.hpp
 LOG_HDR  = log_line.hpp
 
 # Targets which are not files. Without this a file named "test" would make "make test" do nothing
-.PHONY: all test tsan wal_sample mail_log_sample clean
+.PHONY: all test test_scripts tsan wal_sample mail_log_sample clean
 
 all: $(TARGET)
 
@@ -32,6 +32,10 @@ all: $(TARGET)
 # endpoints, JSON to protobuf converter, log lines). All of them run, even if one fails
 test: $(TARGET_TEST)
 	@fail=0; $(MAKE) -C $(WAL_DIR) test || fail=1; $(MAKE) -C $(FILEREADER_DIR) test || fail=1; $(MAKE) -C $(MAILLOG_DIR) test || fail=1; for t in $(TARGET_TEST); do ./$$t || fail=1; done; exit $$fail
+
+# The bash end to end tests in tests/: they start the built otelfwd. Not part of "make test". All of them run, even if one fails
+test_scripts: $(TARGET)
+	@fail=0; for t in tests/test_*.sh; do ./$$t || fail=1; done; exit $$fail
 
 # The WAL test with ThreadSanitizer, see wal/makefile. Not part of "make test": it needs g++ with the sanitizer library (libtsan)
 tsan:

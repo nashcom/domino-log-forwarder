@@ -9,76 +9,19 @@
 #
 # A second instance with a data directory of its own is not affected.
 #
-# What the script needs: the built forwarder (make), or OTELFWD_BIN. It uses UNIX sockets in a temporary directory only: no TCP
-# port, no network. The push URL points to a port where nothing listens, and no record is sent, so nothing is pushed.
+# What the script needs: the built forwarder (make), or OTELFWD_BIN, see common.sh. It uses UNIX sockets in a temporary directory
+# only: no TCP port, no network. The push URL points to a port where nothing listens, and no record is sent.
 #
-#   make otelfwd && ./test_shared_data_dir.sh
+#   make otelfwd && ./tests/test_shared_data_dir.sh
 
-if [ -z "${BASH_VERSION:-}" ]; then
-  echo "this script needs bash" >&2
-  exit 2
-fi
-
-HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-USER_BIN="${OTELFWD_BIN:-}"
-OTELFWD_BIN="${OTELFWD_BIN:-$HERE/otelfwd}"
-
-if [ ! -x "$OTELFWD_BIN" ]; then
-  echo "otelfwd was not found: $OTELFWD_BIN. Build it with \"make\" in the repository, or set OTELFWD_BIN." >&2
-  exit 2
-fi
-
-# A forwarder which is older than its source does not have the behaviour under test, and the failures look like a bug of the
-# program. Only checked for the forwarder of this repository, not for one which was named in OTELFWD_BIN
-if [ -z "$USER_BIN" ] && [ -f "$HERE/otelfwd.cpp" ] && [ "$OTELFWD_BIN" -ot "$HERE/otelfwd.cpp" ]; then
-  echo "otelfwd is older than otelfwd.cpp. Build it first: make otelfwd" >&2
-  exit 2
-fi
+. "$(dirname "${BASH_SOURCE[0]}")/common.sh" || exit 2
 
 if ! command -v timeout >/dev/null 2>&1; then
   echo "this script needs the timeout command" >&2
   exit 2
 fi
 
-WORK="$(mktemp -d)"
-PIDS=""
-PASSED=0
-FAILED=0
-
-cleanup() {
-  local Pid
-
-  exec 9>&-
-  for Pid in $PIDS; do kill "$Pid" 2>/dev/null; done
-  wait 2>/dev/null
-  rm -rf "$WORK"
-}
-
-trap cleanup EXIT
-
-check() {
-  local Ok="$1" Name="$2"
-
-  if [ "$Ok" = "0" ]; then
-    echo "[PASS]  $Name"
-    PASSED=$((PASSED + 1))
-  else
-    echo "[FAIL]  $Name"
-    FAILED=$((FAILED + 1))
-  fi
-}
-
-# Waits until a UNIX socket exists, up to 10 seconds
-wait_for_socket() {
-  local Socket="$1" i
-
-  for i in $(seq 1 100); do
-    if [ -S "$Socket" ]; then return 0; fi
-    sleep 0.1
-  done
-
-  return 1
-}
+LOG_NAMES="first second third fourth"
 
 # Runs otelfwd with its own data directory and UNIX socket. The rest of the arguments are the arguments of otelfwd
 run_fwd() {
@@ -152,19 +95,4 @@ check "$([ "$Rc" = "0" ] && echo 0 || echo 1)" "and it ends with the code 0 on S
 kill -0 "$FIRST" 2>/dev/null
 check $? "the first instance was not disturbed by any of this"
 
-echo
-echo "$PASSED passed, $FAILED failed"
-
-if [ "$FAILED" != "0" ]; then
-  for Log in first second third fourth; do
-    if [ -s "$WORK/$Log.log" ]; then
-      echo >&2
-      echo "--- output of the $Log instance (the last 12 lines) ---" >&2
-      tail -n 12 "$WORK/$Log.log" >&2
-    fi
-  done
-
-  exit 1
-fi
-
-exit 0
+finish
