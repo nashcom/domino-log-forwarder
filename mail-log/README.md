@@ -337,3 +337,8 @@ flat record format, for example `otelfwd`'s socket input, to see a mail record a
 
 `otelfwd` needs `OTLP_PUSH_API_URL` set, and a UNIX socket listening at that path (the default one, or `OTELFWD_UNIX_SOCKET`,
 see the main README, [Socket inputs](../README.md#socket-inputs)).
+
+The socket decides which backend the records go to. An `otelfwd` instance has one destination, so a program which writes mail records
+to a backend of their own writes to the socket of the instance for that backend, and not to the default one. How to run several
+instances, and what has to be different for each, is in the main README,
+[Running more than one instance](../README.md#running-more-than-one-instance).

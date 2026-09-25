@@ -3877,6 +3877,16 @@ int main (int argc, char *argv[])
 
     LogStartupSummary (g_bWalOpened);
 
+    /* Without a WAL a push which fails is lost. In pipe mode that is accepted and shown in the summary and in the health: exiting
+       would close the pipe of the server. A standalone instance has no such pipe, and the usual reason for the WAL not to open is
+       another instance which uses the same OTELFWD_DATA_DIR (the WAL is locked). Exit with an error, so a service manager sees it */
+    if (g_NoStdin && (false == IsNullStr (g_szOtlpPushApiURL)) && (false == g_bWalOpened))
+    {
+        LogError ("-nostdin needs a WAL and it cannot be opened, see the message above. Every instance needs its own OTELFWD_DATA_DIR", g_szWalFile);
+        ExitCode = 1;
+        goto Done;
+    }
+
     curl_global_init (CURL_GLOBAL_DEFAULT);
 
     if ( (0 == g_NoStdin) && (false == IsNullStr (g_szOutputLogFile)) )

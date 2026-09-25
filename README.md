@@ -4,16 +4,16 @@ Forwards the logs and events of an [HCL Domino](https://www.hcl-software.com/dom
 
 The repository has two programs which work together, and some tools to test them:
 
-| Component                                             | What it is                                                                                                                              |
-| :---------------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------- |
-| [`otelfwd`](#otelfwd---the-otel-forwarder)            | The forwarder. Reads the **Domino console log** from STDIN (`server \| otelfwd`) and structured records from local sockets, pushes OTLP |
-| [`domfwd`](domfwd/README.md)                          | Domino server add-in. Reads the **Domino events** (Event Monitoring queue) and sends one structured record per event to `otelfwd`       |
-| [`nginx/`](nginx/README.md)                           | Test NGINX container which logs via syslog into `otelfwd`, and the end to end load test                                                 |
-| [`tools/victorialogs/`](tools/victorialogs/README.md) | VictoriaLogs container: a real log database to try `otelfwd` with. It needs `OTLP_PUSH_ENCODING=protobuf`                               |
-| [`wal/`](wal/README.md)                               | The write ahead log of `otelfwd` as a module of its own: usable by other programs, with a sample program and its tests                  |
-| [`filereader/`](filereader/README.md)                 | Follows a growing text file line by line and remembers its position. A module of its own, used by the file input of `otelfwd`          |
+| Component                                             | What it is                                                                                                                                               |
+| :---------------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| [`otelfwd`](#otelfwd---the-otel-forwarder)            | The forwarder. Reads the **Domino console log** from STDIN (`server \| otelfwd`) and structured records from local sockets, pushes OTLP                  |
+| [`domfwd`](domfwd/README.md)                          | Domino server add-in. Reads the **Domino events** (Event Monitoring queue) and sends one structured record per event to `otelfwd`                        |
+| [`nginx/`](nginx/README.md)                           | Test NGINX container which logs via syslog into `otelfwd`, and the end to end load test                                                                  |
+| [`tools/victorialogs/`](tools/victorialogs/README.md) | VictoriaLogs container: a real log database to try `otelfwd` with. It needs `OTLP_PUSH_ENCODING=protobuf`                                                |
+| [`wal/`](wal/README.md)                               | The write ahead log of `otelfwd` as a module of its own: usable by other programs, with a sample program and its tests                                   |
+| [`filereader/`](filereader/README.md)                 | Follows a growing text file line by line and remembers its position. A module of its own, used by the file input of `otelfwd`                            |
 | [`mail-log/`](mail-log/README.md)                     | Builds one OTel log record out of a mail message's sender, recipients, subject and meta data, with a sample generator. Not used by otelfwd or domfwd yet |
-| [`tools/otel-sink/`](tools/otel-sink/README.md)       | Test OTLP receiver container                                                                                                            |
+| [`tools/otel-sink/`](tools/otel-sink/README.md)       | Test OTLP receiver container                                                                                                                             |
 
 `otelfwd` is general purpose. Everything which can write a line of text or a JSON record to a local socket can use it, for example NGINX. The Domino specific parts are the console log annotation and `domfwd`.
 
@@ -152,10 +152,153 @@ otelfwd -nostdin
 ```
 
 * `OTLP_PUSH_API_URL` has to be set, and at least one input has to work: a socket input, or the [file input](#file-input). Without a configured input the default UNIX socket is used. Otherwise the forwarder logs an error and ends with exit code 1.
-* `OTELFWD_DATA_DIR` is the directory for the WAL and for the metrics file. It has to be writable. See [Additional configuration](#additional-configuration).
+* `OTELFWD_DATA_DIR` is the directory for the WAL and for the metrics file. It has to be writable. With `-nostdin` the WAL has to open: if it cannot, for example because another instance uses the same directory, the forwarder exits with the code 1. See [Additional configuration](#additional-configuration).
 * `OTELFWD_MIRROR_STDOUT` and `OTELFWD_OUTPUT_LOG` only apply to lines read from STDIN. They are ignored with `-nostdin` and a warning is logged.
 * The WAL is replayed while the forwarder is running. Records received before a shutdown are pushed first, and records which could not be pushed stay in the WAL for the next start.
 * Only records received via the socket inputs and the file input are pushed. They carry their own attributes. The annotation with the Domino server task name via `pid.nbf` only applies to lines read from STDIN.
+
+## Running more than one instance
+
+**One instance is one logical OTLP destination, optionally with a backup for high availability.** The primary and the backup URL
+are two endpoints of the same destination, not two targets: they share the token, the CA file and the encoding, and `otelfwd`
+fails over to the backup and back again.
+
+To send different kinds of records to different backends, for example the records of the email subsystem to Loki and the Domino
+events to VictoriaLogs, run **one instance per destination** and let each producer write to the socket or port of the instance it
+belongs to. `otelfwd` does not route records to different targets on purpose: an instance is a process of its own with its own
+queue, its own WAL and its own failures, so a backend which is down or slow fills its own WAL and delays no other instance. The
+producer chooses the destination by choosing the socket. Sending one record to several backends, or filtering, transforming or
+routing records by their content, is a job for an OpenTelemetry Collector downstream of `otelfwd`, not for `otelfwd`.
+
+Plan the instances first, one row each. Everything in a column must differ between the instances:
+
+| Instance | Data directory            | UNIX socket                        | TCP (loopback)   | Target                 |
+| :------- | :------------------------ | :--------------------------------- | :--------------- | :--------------------- |
+| mail     | `/var/lib/otelfwd-mail`   | `/run/otelfwd-mail/otelfwd.sock`   | `127.0.0.1:4391` | Loki, JSON             |
+| domino   | `/var/lib/otelfwd-domino` | `/run/otelfwd-domino/otelfwd.sock` | `127.0.0.1:4392` | VictoriaLogs, protobuf |
+
+### What every instance needs of its own
+
+| What                    | Setting                                                                                                  | If two instances use the same                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| :---------------------- | :------------------------------------------------------------------------------------------------------- | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Data directory          | `OTELFWD_DATA_DIR`                                                                                       | It holds the WAL, which is locked. The second instance cannot open the WAL of the first. With `-nostdin` it exits with the code 1 and says why. In pipe mode it keeps running, because an exit would close the pipe of the server: it has no WAL then, its start summary says `cannot be opened, failed pushes cannot be kept`, its health is an error, and a push which fails is lost. The default UNIX socket and the metrics file are below this directory too |
+| UNIX socket             | `OTELFWD_UNIX_SOCKET`                                                                                    | The second instance logs `Unix socket is in use by another process` and this input does not start. Give every instance its own path and its own directory for it                                                                                                                                                                                                                                                                                                  |
+| TCP port                | `OTELFWD_TCP_LISTEN`                                                                                     | The second instance logs `Cannot listen on TCP address` and this input does not start. Loopback only, and there is no default port: use a different port for each instance                                                                                                                                                                                                                                                                                        |
+| Syslog socket           | `OTELFWD_SYSLOG_SOCKET`                                                                                  | The same as for the UNIX socket. Its file mode is `OTELFWD_SYSLOG_SOCKET_MODE`, and the sender (NGINX) must be able to write to it                                                                                                                                                                                                                                                                                                                                |
+| File input              | `OTELFWD_FILE_INPUT`                                                                                     | A file is followed by one instance. Its state file is next to it by default, or in `OTELFWD_FILE_STATE_DIR`                                                                                                                                                                                                                                                                                                                                                       |
+| STDIN                   | `otelfwd` without `-nostdin`                                                                             | There is one STDIN: the pipe of the Domino console log. Only one instance reads it, all the others run with `-nostdin`                                                                                                                                                                                                                                                                                                                                            |
+| Target and its format   | `OTLP_PUSH_API_URL`, `OTLP_PUSH_API_URL_BACKUP`, `OTLP_PUSH_ENCODING`, `OTLP_PUSH_TOKEN`, `OTLP_CA_FILE` | This is what the instances are for: each has its own. Each backend documents the URL path and the encoding it expects                                                                                                                                                                                                                                                                                                                                             |
+| Identity of the records | `OTLP_SERVICE_NAME`, `OTLP_SERVICE_NAMESPACE`, `OTLP_SERVICE_INSTANCE_ID`, `OTELFWD_HOSTNAME`            | The default resource of the records which carry none. Set them if the records of the instances should be told apart by it                                                                                                                                                                                                                                                                                                                                         |
+| Metrics file            | `OTELFWD_PROM_FILE`                                                                                      | The default is below the data directory, so it differs already. The metrics of all instances have the same names and no label which says which instance they come from: keep the files apart when you collect them                                                                                                                                                                                                                                                |
+
+The default UNIX socket (`<data>/domino/otelfwd.sock`) is only opened when `OTLP_PUSH_API_URL` is set and none of the three socket
+settings is configured. An instance with an explicit socket, port or syslog socket does not open it. A socket is created with the
+mode `OTELFWD_UNIX_SOCKET_MODE` (default `0600`, only the user who started it), so run the instances as the user of the
+producers which write to them.
+
+### Example: two standalone instances
+
+The instances of the plan above. The URLs and the encodings are examples: see the documentation of each backend.
+
+```bash
+OTELFWD_DATA_DIR=/var/lib/otelfwd-mail \
+OTELFWD_UNIX_SOCKET=/run/otelfwd-mail/otelfwd.sock \
+OTELFWD_TCP_LISTEN=127.0.0.1:4391 \
+OTLP_PUSH_API_URL=http://loki:3100/otlp/v1/logs \
+OTLP_PUSH_ENCODING=json \
+otelfwd -nostdin
+```
+
+```bash
+OTELFWD_DATA_DIR=/var/lib/otelfwd-domino \
+OTELFWD_UNIX_SOCKET=/run/otelfwd-domino/otelfwd.sock \
+OTELFWD_TCP_LISTEN=127.0.0.1:4392 \
+OTLP_PUSH_API_URL=https://victorialogs:9428/insert/opentelemetry/v1/logs \
+OTLP_PUSH_ENCODING=protobuf \
+otelfwd -nostdin
+```
+
+To see what an instance will really use before you rely on it, put `-nostdin` before `-cfg` and start it with its environment:
+`-cfg` prints the data directory, the sockets and the target, and exits.
+
+### Pointing the producers at an instance
+
+The producer decides which instance a record goes to, by where it writes:
+
+* **A program which builds its own records** (for example one which uses the [mail-log](mail-log/README.md) class) sends each
+  line to the UNIX socket or the TCP port of its instance, for example `/run/otelfwd-mail/otelfwd.sock`.
+* **The Domino event add-in** (`domfwd`) has its own `DOMFWD_Socket`, `unix:/run/otelfwd-domino/otelfwd.sock` or
+  `tcp:127.0.0.1:4392`, see [domfwd](domfwd/README.md).
+* **NGINX** logs to the syslog socket of the instance which owns it (`OTELFWD_SYSLOG_SOCKET`).
+* **The Domino console log** is the STDIN of the one instance which is not started with `-nostdin`.
+
+A single input cannot be split by content: everything which arrives on one socket goes to the instance which owns it. If records
+for different backends would arrive on one input, for example NGINX access and error logs on one syslog socket, give each kind
+its own socket at the producer.
+
+### Why an instance has only one destination
+
+This was discussed at length, and the result is a deliberate boundary: **`otelfwd` forwards to one logical destination and does not
+route.** The reasons, so the question does not have to be worked out again:
+
+**A target is more than a URL.** Every target has its own state: the URL and its backup, the encoding, the token and the CA file,
+a queue, a WAL, the retry and the failover, the metrics and the health. Several targets inside one process would need all of that
+once for each target, plus a routing layer in front. That is several forwarders in one process.
+
+**The targets would not be independent.** If one backend becomes slow, its requests and its WAL must not hold up another. To
+guarantee that inside one process, every target needs its own queue and its own execution path, and then the CPU, the memory, the
+locks, the queue limits and the shutdown are shared concerns between them. Three couplings show up first:
+
+* **The WAL is replayed in order.** A failed entry stops the replay, so entries for two targets in one WAL block each other. Every
+  target needs its own WAL.
+* **One push thread shares its delays.** A backend which is down already costs a connect timeout for every batch. With one thread,
+  that delay goes to every other target too, unless each target has a thread or a cooldown of its own.
+* **One queue shares its losses.** A slow target which fills a shared queue makes the socket inputs drop records which were meant
+  for a healthy target.
+
+Choosing the target late, when the batch is pushed, and splitting the batch by target so that no request mixes targets works
+well, but it is the easy part. The three couplings and everything around them (the settings of each target, its secrets, its
+metrics and health, the tests for all of it) remain.
+
+**Separate instances give the independence for free.** Each instance is its own process, so it is its own failure domain and its
+own scaling domain, with its own queue and WAL. The operating system does the isolation.
+
+```
+one process, several targets (not built)
+
+                    ┌── Loki
+Producer ── otelfwd ┼── VictoriaLogs
+                    └── Collector
+```
+
+```
+one instance for each destination (how it is done)
+
+Producer A ──► otelfwd A ──► Loki
+                    │
+                    └── WAL A
+
+Producer B ──► otelfwd B ──► VictoriaLogs
+                    │
+                    └── WAL B
+```
+
+**The producer picks the destination by picking the socket.** `otelfwd` does not become a routing product, and it has no rules to
+configure, test and explain.
+
+**A backup endpoint is not a second target.** The primary and the backup URL are the same logical destination, so they share the
+configuration and `otelfwd` fails over between them and back. That is high availability. Independent destinations are separate
+instances.
+
+**Fan-out, filtering and transformation belong downstream.** Sending one record to several backends, dropping or changing records
+by their content, or routing by an attribute value is what an OpenTelemetry Collector does. If that is needed, put a Collector
+behind an instance.
+
+**What instances cannot do:** they split by input, not by content. One input which carries records for two backends goes to the one
+instance which owns it, and the fix is at the producer, a socket of its own for each kind. If a real input ever has to be split by
+content and cannot be split at the producer, a smaller design than the first one is the place to start: route after the batch is
+taken, split it by target, with a WAL per target and a cooldown after a failure. It is not built, because a separate process costs
+no code at all.
 
 ## Command line
 
@@ -534,15 +677,16 @@ Both scripts print how many lines were pushed and return an error if the push fa
 
 ## Testing
 
-| Test                     | How to run                                                                                       | What it needs             | What it checks                                                                                                                                                                                                                            |
-| :----------------------- | :----------------------------------------------------------------------------------------------- | :------------------------ | :---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| WAL unit test            | `make test`                                                                                      | a C++ compiler and `make` | The WAL module on its own: behaviour, failures, crashes, use from several threads, one record at a time (Peek and Ack), the size limit, its messages, speed ([details](wal/README.md#the-tests))                                          |
-| File reader unit test    | `make test`                                                                                      | a C++ compiler and `make` | The file reader module on its own: complete and unfinished lines, commit and restart, rotation, truncation, damaged state files, long lines ([details](filereader/README.md#test))                                                        |
-| MailLog unit test        | `make test`                                                                                      | a C++ compiler and `make` | The MailLog module on its own: every field, the order of the attributes, header name normalization, escaping ([details](mail-log/README.md#test))                                                                                         |
-| Unit test of otelfwd     | `make test`                                                                                      | a C++ compiler and `make` | The failover between two OTLP endpoints (backup, failback timing, refused data, threads), the converter from JSON to protobuf, and the format of the log lines ([details](#unit-test-of-otelfwd))                                         |
-| Durable sender test      | `make test`                                                                                      | a C++ compiler and `make` | The socket sender of `domfwd` together with the WAL: lines wait on disk while the receiver is down, arrive in order when it is back, survive a restart and the end of the program ([details](#unit-test-of-the-durable-sender-of-domfwd)) |
-| Load test                | `./nginx/run_loadtest.sh`                                                                        | Docker                    | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                                                                                 |
-| Load test with an outage | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                    | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end))                                                                |
+| Test                       | How to run                                                                                       | What it needs                                 | What it checks                                                                                                                                                                                                                                                        |
+| :------------------------- | :----------------------------------------------------------------------------------------------- | :-------------------------------------------- | :-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| WAL unit test              | `make test`                                                                                      | a C++ compiler and `make`                     | The WAL module on its own: behaviour, failures, crashes, use from several threads, one record at a time (Peek and Ack), the size limit, its messages, speed ([details](wal/README.md#the-tests))                                                                      |
+| File reader unit test      | `make test`                                                                                      | a C++ compiler and `make`                     | The file reader module on its own: complete and unfinished lines, commit and restart, rotation, truncation, damaged state files, long lines ([details](filereader/README.md#test))                                                                                    |
+| MailLog unit test          | `make test`                                                                                      | a C++17 compiler (g++ 11 or newer) and `make` | The MailLog module on its own: every field, the order of the attributes, header name normalization, escaping ([details](mail-log/README.md#test))                                                                                                                     |
+| Unit test of otelfwd       | `make test`                                                                                      | a C++ compiler and `make`                     | The failover between two OTLP endpoints (backup, failback timing, refused data, threads), the converter from JSON to protobuf, and the format of the log lines ([details](#unit-test-of-otelfwd))                                                                     |
+| Durable sender test        | `make test`                                                                                      | a C++ compiler and `make`                     | The socket sender of `domfwd` together with the WAL: lines wait on disk while the receiver is down, arrive in order when it is back, survive a restart and the end of the program ([details](#unit-test-of-the-durable-sender-of-domfwd))                             |
+| Load test                  | `./nginx/run_loadtest.sh`                                                                        | Docker                                        | Every event of a large NGINX load arrives at a test receiver exactly once                                                                                                                                                                                             |
+| Load test with an outage   | `./nginx/run_loadtest.sh --yes --threads 4 --requests 2000 --fail-for 10 --wait 420 --stall 200` | Docker                                        | The same while the receiver fails for 10 seconds: the events must be kept in the WAL and arrive after the replay ([details](#load-test-with-an-outage-the-wal-end-to-end))                                                                                            |
+| Shared data directory test | `./test_shared_data_dir.sh`                                                                      | the built `otelfwd`, `bash`                   | Two instances on one data directory: with `-nostdin` the second exits with the code 1 and says why, in pipe mode it keeps running and says that it has no WAL, and an instance with a data directory of its own is not affected. UNIX sockets only, nothing is pushed |
 
 `--yes` in the commands of `run_loadtest.sh` means: do not ask for the size of the test. Without it, the script asks in a terminal for the number of threads and requests, and Enter takes the default (8 threads with 10,000 requests each). `./nginx/run_loadtest.sh --help` lists all options of the script and of the load test program.
 
